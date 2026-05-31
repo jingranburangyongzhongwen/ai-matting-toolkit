@@ -1,0 +1,22 @@
+# 深度学习框架
+torch
+torchvision
+
+# 模型库
+transformers
+safetensors
+kornia
+timm
+huggingface_hub
+
+# SAM 交互式分割
+mobile-sam @ git+https://github.com/ChaoningZhang/MobileSAM.git
+segment-anything-hq
+
+# 图像处理
+opencv-contrib-python
+Pillow
+numpy
+
+# Web UI
+gradio>=4.0

@@ -1,0 +1,6 @@
+*.pyc
+models/
+.claude
+.history
+output/
+.vscode/
