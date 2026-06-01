@@ -1,5 +1,5 @@
 # ── 导入和全局初始化 ─────────────────────────────────────────────
-import gc, os, warnings, signal, time
+import gc, hashlib, os, warnings, signal, time
 import gradio as gr
 import numpy as np
 from PIL import Image
@@ -16,6 +16,7 @@ from model_manager import (
 os.environ["HF_HOME"] = os.path.join(get_base_path(), "models", "cache")
 mgr = ModelManager()
 KEEP_RESIDENT_FREE_GB = 6.0
+_SAM_IMAGE_FINGERPRINT = None
 ENGINE_MODE_MAP = {
     "快速模式（MobileSAM）": "mobile_sam",
     "高精度模式（SAM-HQ）": "sam_hq",
@@ -25,39 +26,52 @@ VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}
 
 
 # ── Tab 1 后端：一键抠图 ────────────────────────────────────────
+def _unload_sam_and_reset_state():
+    """卸载 SAM 并同步清空本模块维护的图像指纹。"""
+    global _SAM_IMAGE_FINGERPRINT
+    mgr.unload_sam()
+    _SAM_IMAGE_FINGERPRINT = None
+
+
 def on_auto_process(files, detect_transparent, vitmatte_variant, process_mode,
                     save_debug=False):
-    """generator，yield (preview_img, status_text, result_img)"""
+    """generator，yield (preview_img, status_text, result_img, result_view_btn)"""
     if not files:
-        yield None, "请先上传图片", None
+        yield None, "请先上传图片", None, gr.update(visible=False)
         return
-
-    # 显存不足时卸载 SAM 和（非透明模式下）Grounding-DINO
-    if free_vram_gb() < KEEP_RESIDENT_FREE_GB:
-        mgr.unload_sam()
-        if not detect_transparent:
-            mgr.unload_grounding_dino()
 
     # 映射 ViTMatte 变体
     variant_key = VITMATTE_VARIANTS.get(vitmatte_variant, "none")
     # 映射推理模式
     refine_mode = VITMATTE_PROCESS_MODES.get(process_mode, "strip")
 
+    needs_vitmatte = variant_key != "none"
+    needs_dino = bool(detect_transparent)
+    low_vram = free_vram_gb() < KEEP_RESIDENT_FREE_GB
+
+    # RMBG-2.0 也需要推理显存；低显存时始终释放本次不会使用的常驻模型。
+    if low_vram:
+        _unload_sam_and_reset_state()
+        if not needs_dino:
+            mgr.unload_grounding_dino()
+        if not needs_vitmatte:
+            mgr.unload_vitmatte()
+
     refiner = None
-    if variant_key != "none":
+    if needs_vitmatte:
         try:
             mgr.switch_vitmatte(variant_key)
             refiner = mgr.vitmatte
         except FileNotFoundError as e:
-            yield None, f"模型加载失败: {e}", None
+            yield None, f"模型加载失败: {e}", None, gr.update(visible=False)
             return
-        yield None, f"ViTMatte ({variant_key}) 已加载", None
+        yield None, f"ViTMatte ({variant_key}) 已加载", None, gr.update(visible=False)
 
     # 透明物体检测器
     detector = None
     if detect_transparent:
         detector = mgr.grounding_dino
-        yield None, "Grounding-DINO 已加载，开始处理...", None
+        yield None, "Grounding-DINO 已加载，开始处理...", None, gr.update(visible=False)
 
     output_dir = get_output_path()
     total = len(files)
@@ -71,7 +85,7 @@ def on_auto_process(files, detect_transparent, vitmatte_variant, process_mode,
             continue
 
         fname = os.path.basename(str(f))
-        yield None, f"[{idx + 1}/{total}] 正在处理: {fname}", last_result
+        yield None, f"[{idx + 1}/{total}] 正在处理: {fname}", last_result, gr.update(visible=(last_result is not None))
 
         try:
             img = Image.open(f).convert("RGB")
@@ -84,7 +98,7 @@ def on_auto_process(files, detect_transparent, vitmatte_variant, process_mode,
             debug_dir = os.path.join(output_dir, os.path.splitext(fname)[0] + "_debug")
 
         last_original = np.array(img)
-        yield last_original, f"[{idx + 1}/{total}] RMBG-2.0 推理中: {fname}", last_result
+        yield last_original, f"[{idx + 1}/{total}] RMBG-2.0 推理中: {fname}", last_result, gr.update(visible=(last_result is not None))
 
         result = mgr.rmbg2.remove_background(
             img,
@@ -104,7 +118,7 @@ def on_auto_process(files, detect_transparent, vitmatte_variant, process_mode,
         result.save(out_path)
 
         last_result = result
-        yield np.array(img), f"[{idx + 1}/{total}] 完成: {fname} → {os.path.basename(out_path)}", result
+        yield np.array(img), f"[{idx + 1}/{total}] 完成: {fname} → {os.path.basename(out_path)}", result, gr.update(visible=True)
 
         # 清理
         del img
@@ -113,66 +127,113 @@ def on_auto_process(files, detect_transparent, vitmatte_variant, process_mode,
 
     if last_result is not None:
         done_msg = f"全部完成，共处理 {total} 张，结果保存在 output/"
-        yield last_original, done_msg, last_result
+        yield last_original, done_msg, last_result, gr.update(visible=True)
     else:
-        yield last_original, "没有有效图片被处理", None
+        yield last_original, "没有有效图片被处理", None, gr.update(visible=False)
 
 
 def on_auto_upload(files):
-    """隐藏上传区，显示预览图"""
+    """上传后隐藏上传提示，显示原图预览。"""
     if not files:
-        return gr.update(visible=False), gr.update(), gr.update()
+        return gr.update(value=None, visible=True), gr.update(value=None, visible=False), \
+            gr.update(visible=False), gr.update(visible=False), None, \
+            gr.update(visible=False), "请先上传图片"
     first = files[0] if isinstance(files, list) else files
     try:
         img = Image.open(first).convert("RGB")
-        return gr.update(visible=False), np.array(img), gr.update(visible=True)
+        return gr.update(visible=False), gr.update(value=np.array(img), visible=True), \
+            gr.update(visible=True), gr.update(visible=True), None, \
+            gr.update(visible=False), "图片已上传，点击开始抠图"
     except Exception:
-        return gr.update(visible=False), None, gr.update(visible=True)
+        return gr.update(value=None, visible=True), gr.update(value=None, visible=False), \
+            gr.update(visible=False), gr.update(visible=False), None, \
+            gr.update(visible=False), "图片加载失败"
 
 
-def on_auto_swap():
-    """换图：显示上传区，隐藏预览和换图按钮"""
-    return gr.update(visible=True), None, gr.update(visible=False)
+def on_auto_clear_source():
+    """清空原图区：恢复上传提示，隐藏预览和清空按钮。"""
+    return gr.update(value=None, visible=True), gr.update(value=None, visible=False), \
+        gr.update(visible=False), gr.update(visible=False), None, \
+        gr.update(visible=False), "请先上传图片"
+
+
+def on_vitmatte_variant_change(vitmatte_variant):
+    """直出不需要 ViTMatte 推理模式；只在精修模型启用时显示。"""
+    variant_key = VITMATTE_VARIANTS.get(vitmatte_variant, "none")
+    return gr.update(visible=(variant_key != "none"))
 
 
 # ── Tab 2 后端：精细选区 ────────────────────────────────────────
+def _image_fingerprint(image):
+    """生成轻量图像指纹，用于判断 SAM 缓存是否对应当前图。"""
+    if image is None:
+        return None
+    arr = np.ascontiguousarray(image)
+    digest = hashlib.blake2b(arr.view(np.uint8), digest_size=16).hexdigest()
+    return arr.shape, arr.dtype.str, digest
+
+
+def _reset_sam_interaction_state():
+    """清理 SAM 的交互先验，避免旧 mask/logits 污染下一次标记。"""
+    if mgr._sam_engine is None:
+        return
+    mgr.sam._prev_logits = None
+    mgr.sam._prev_npoints = 0
+    mgr.sam._cached_mask = None
+
+
 def _ensure_sam_ready(image, engine_mode):
     """确保 SAM 引擎就绪，返回是否切换了引擎"""
+    global _SAM_IMAGE_FINGERPRINT
     engine_type = ENGINE_MODE_MAP.get(engine_mode, "mobile_sam")
     switched = mgr.switch_sam(engine_type)
-    if switched or not mgr.sam._image_set:
+    fingerprint = _image_fingerprint(image)
+    if switched or not mgr.sam._image_set or fingerprint != _SAM_IMAGE_FINGERPRINT:
         mgr.sam.set_image(image)
+        _SAM_IMAGE_FINGERPRINT = fingerprint
         return True
     return False
 
 
 def on_image_upload(files):
-    """隐藏上传区，显示画布"""
+    """上传后隐藏上传提示，显示画布。"""
+    global _SAM_IMAGE_FINGERPRINT
+    _SAM_IMAGE_FINGERPRINT = None
+    _reset_sam_interaction_state()
     if not files:
-        return gr.update(visible=False), gr.update(), gr.update(), [], None, "请先上传图片"
+        return gr.update(value=None, visible=True), gr.update(value=None, visible=False), \
+            gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), \
+            [], [], None, None, "请先上传图片"
     first = files[0] if isinstance(files, list) else files
     try:
         img = Image.open(first).convert("RGB")
-        return gr.update(visible=False), np.array(img), gr.update(visible=True), \
-            [], None, "图片已上传，点击图片选取区域或用文本定位"
+        return gr.update(visible=False), gr.update(value=np.array(img), visible=True), \
+            gr.update(visible=True), gr.update(visible=True), gr.update(visible=False), \
+            [], [], None, None, "图片已上传，点击图片选取区域或用文本定位"
     except Exception:
-        return gr.update(visible=False), None, gr.update(visible=True), \
-            [], None, "图片加载失败"
+        return gr.update(value=None, visible=True), gr.update(value=None, visible=False), \
+            gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), \
+            [], [], None, None, "图片加载失败"
 
 
-def on_canvas_swap():
-    """换图：显示上传区，清空画布和标记"""
-    return gr.update(visible=True), None, gr.update(visible=False), [], [], None
+def on_canvas_clear_source():
+    """清空原图区：恢复上传提示，并清空画布、结果和标记。"""
+    global _SAM_IMAGE_FINGERPRINT
+    _SAM_IMAGE_FINGERPRINT = None
+    _reset_sam_interaction_state()
+    return gr.update(value=None, visible=True), gr.update(value=None, visible=False), \
+        gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), \
+        [], [], None, None, "请先上传图片"
 
 
 def on_image_click(image, evt: gr.SelectData, mode, engine_mode,
                    points_state, labels_state, box_state):
     if image is None:
-        return image, points_state, labels_state, box_state, "请先上传图片"
+        return image, gr.update(visible=False), points_state, labels_state, box_state, "请先上传图片"
     try:
         x, y = evt.index[0], evt.index[1]
     except Exception:
-        return image, points_state, labels_state, box_state, "无法获取点击坐标"
+        return image, gr.update(visible=False), points_state, labels_state, box_state, "无法获取点击坐标"
 
     label = 1 if mode == "正向选取（我要）" else 0
     new_points = list(points_state) + [[x, y]]
@@ -185,25 +246,26 @@ def on_image_click(image, evt: gr.SelectData, mode, engine_mode,
         )
         tag = "正向" if label == 1 else "负向"
         status = f"已添加{tag}标记 ({x}, {y})，共 {len(new_points)} 个点"
-        return overlay, new_points, new_labels, box_state, status
+        return overlay, gr.update(visible=True), new_points, new_labels, box_state, status
     except Exception as e:
-        return image, new_points, new_labels, box_state, f"预测失败: {e}"
+        return image, gr.update(visible=False), new_points, new_labels, box_state, f"预测失败: {e}"
 
 
 def on_text_locate(image, caption, engine_mode):
     if image is None:
-        return None, [], [], None, "请先上传图片"
+        return None, gr.update(visible=False), [], [], None, "请先上传图片"
     if not caption or not caption.strip():
-        return image, [], [], None, "请输入定位描述"
+        return image, gr.update(visible=False), [], [], None, "请输入定位描述"
 
     try:
         _ensure_sam_ready(image, engine_mode)
+        _reset_sam_interaction_state()
         caption_for_dino = caption.strip()
         if not caption_for_dino.endswith("."):
             caption_for_dino += "."
         boxes = mgr.grounding_dino.detect(image, caption=caption_for_dino)
         if not boxes:
-            return image, [], [], None, "未找到匹配物体"
+            return image, gr.update(visible=False), [], [], None, "未找到匹配物体"
 
         # 多个框合并为外接矩形，加 margin 给 SAM 足够上下文
         xs = []
@@ -223,21 +285,21 @@ def on_text_locate(image, caption, engine_mode):
 
         overlay = mgr.sam.predict_and_overlay(image, [], [], box=box)
         status = f"文本定位: '{caption}' → 框 [{int(box[0])},{int(box[1])},{int(box[2])},{int(box[3])}]"
-        return overlay, [], [], box, status
+        return overlay, gr.update(visible=True), [], [], box, status
     except Exception as e:
-        return image, [], [], None, f"定位失败: {e}"
+        return image, gr.update(visible=False), [], [], None, f"定位失败: {e}"
 
 
 def on_generate_cutout(image, engine_mode, points_state,
                        labels_state, box_state):
-    """generator，yield (result_img, status_text)"""
+    """generator，yield (result_img, result_view_btn, status_text)"""
     if image is None or (not points_state and box_state is None):
-        yield None, "请先上传图片并标记区域"
+        yield None, gr.update(visible=False), "请先上传图片并标记区域"
         return
 
     try:
         # SAM 分割（优先用交互 overlay 缓存的 mask，保证一致）
-        yield gr.update(), "SAM 分割中..."
+        yield gr.update(), gr.update(), "SAM 分割中..."
         _ensure_sam_ready(image, engine_mode)
         if mgr.sam._cached_mask is not None:
             mask = mgr.sam._cached_mask
@@ -256,15 +318,26 @@ def on_generate_cutout(image, engine_mode, points_state,
             counter += 1
         result.save(out_path)
 
-        yield result, f"完成！已保存到 {os.path.basename(out_path)}"
+        yield result, gr.update(visible=True), f"完成！已保存到 {os.path.basename(out_path)}"
     except Exception as e:
-        yield None, f"生成失败: {e}"
+        yield None, gr.update(visible=False), f"生成失败: {e}"
 
 
 def on_clear_points(image):
     if image is None:
-        return None, [], [], None, "请先上传图片"
-    return image, [], [], None, "标记和文本定位已清除"
+        return None, gr.update(visible=False), [], [], None, "请先上传图片"
+    _reset_sam_interaction_state()
+    return None, gr.update(visible=False), [], [], None, "标记和文本定位已清除"
+
+
+def on_engine_mode_change(image):
+    """切换 SAM 引擎后清空旧选区预览，避免新旧引擎结果混淆。"""
+    global _SAM_IMAGE_FINGERPRINT
+    _SAM_IMAGE_FINGERPRINT = None
+    _reset_sam_interaction_state()
+    if image is None:
+        return None, gr.update(visible=False), [], [], None, "请先上传图片"
+    return None, gr.update(visible=False), [], [], None, "引擎已切换，请重新标记"
 
 
 # ── APP_CSS 样式 ────────────────────────────────────────────────
@@ -350,6 +423,8 @@ body {
     border-radius: var(--radius) !important;
     padding: 12px !important;
     box-shadow: var(--shadow);
+    min-width: 0 !important;
+    overflow: hidden !important;
 }
 
 /* ── 标题 ── */
@@ -370,6 +445,12 @@ body {
     padding: 2px 8px;
     border-radius: 20px;
     font-weight: 600;
+}
+.section-hint {
+    font-size: 0.75em;
+    color: var(--ink-muted);
+    font-weight: 400;
+    margin-left: 8px;
 }
 
 /* ── 上传区虚线边框 ── */
@@ -395,6 +476,102 @@ body {
     border-radius: var(--radius) !important;
     overflow: hidden;
 }
+.checkerboard,
+.checkerboard > div,
+.checkerboard .image-container,
+.checkerboard [data-testid="image"],
+.checkerboard [data-testid="image"] > div {
+    max-width: 100% !important;
+    width: 100% !important;
+    min-width: 0 !important;
+}
+.checkerboard img,
+.checkerboard canvas {
+    display: block !important;
+    max-width: 100% !important;
+    width: 100% !important;
+    height: auto !important;
+    max-height: min(68vh, 760px) !important;
+    object-fit: contain !important;
+    border-radius: var(--radius) !important;
+}
+.checkerboard button[aria-label*="fullscreen" i],
+.checkerboard button[aria-label*="全屏"],
+.checkerboard button[aria-label*="放大"],
+.checkerboard button[title*="fullscreen" i],
+.checkerboard button[title*="全屏"],
+.checkerboard button[title*="放大"] {
+    display: none !important;
+}
+
+/* ── 浏览器级图片弹层 ── */
+.image-lightbox-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 2147483647;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 32px;
+    background: rgba(7, 10, 18, 0.86);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+}
+.image-lightbox-overlay.open {
+    display: flex;
+}
+.image-lightbox-frame {
+    max-width: min(96vw, 1600px);
+    max-height: 92vh;
+    border-radius: 22px;
+    padding: 0;
+    background-color: #f7f7fb;
+    background-image:
+        linear-gradient(45deg, #d7dbe4 25%, transparent 25%),
+        linear-gradient(-45deg, #d7dbe4 25%, transparent 25%),
+        linear-gradient(45deg, transparent 75%, #d7dbe4 75%),
+        linear-gradient(-45deg, transparent 75%, #d7dbe4 75%);
+    background-size: 24px 24px;
+    background-position: 0 0, 0 12px, 12px -12px, -12px 0;
+    box-shadow: 0 24px 80px rgba(0,0,0,0.38);
+    overflow: hidden;
+}
+.image-lightbox-frame img {
+    display: block;
+    max-width: min(96vw, 1600px);
+    max-height: 92vh;
+    object-fit: contain;
+    border-radius: 22px;
+}
+.image-lightbox-close {
+    position: fixed;
+    top: 22px;
+    right: 24px;
+    width: 42px;
+    height: 42px;
+    border: 1px solid rgba(255,255,255,0.28);
+    border-radius: 50%;
+    background: rgba(255,255,255,0.14);
+    color: #fff;
+    font-size: 24px;
+    line-height: 1;
+    cursor: pointer;
+}
+.image-lightbox-close:hover {
+    background: rgba(255,255,255,0.24);
+}
+body.image-lightbox-open {
+    overflow: hidden;
+}
+.preview-actions {
+    margin-top: 8px;
+    display: flex;
+    justify-content: flex-end;
+}
+.preview-actions button,
+.preview-open-btn button {
+    font-size: 0.84em !important;
+}
 
 /* ── 按钮胶囊形 ── */
 .btn-primary, .btn-primary button {
@@ -404,9 +581,12 @@ body {
     border-radius: 50px !important;
     padding: 10px 28px !important;
     font-weight: 600 !important;
+    transition: filter 0.18s ease, transform 0.18s ease, box-shadow 0.18s ease !important;
 }
 .btn-primary:hover, .btn-primary button:hover {
     filter: brightness(1.1);
+    box-shadow: var(--button-primary-shadow-hover) !important;
+    transform: translateY(-1px);
 }
 .btn-secondary, .btn-secondary button {
     background: var(--glass) !important;
@@ -419,6 +599,20 @@ body {
 .btn-secondary:hover, .btn-secondary button:hover {
     background: var(--panel) !important;
     color: var(--ink) !important;
+}
+
+/* ── 文本定位区域：去掉 Gradio 默认灰底，按钮沿用主操作样式 ── */
+.text-locate-panel {
+    background: transparent !important;
+    border: 0 !important;
+    padding: 0 !important;
+    box-shadow: none !important;
+}
+.text-locate-panel > div {
+    background: transparent !important;
+    border: 0 !important;
+    padding: 0 !important;
+    box-shadow: none !important;
 }
 
 /* ── Radio 分段选择器（iOS segmented control）── */
@@ -493,6 +687,73 @@ input[type="checkbox"] {
 """
 
 
+APP_JS = """
+(() => {
+    if (window.__mattingLightboxReady) return;
+    window.__mattingLightboxReady = true;
+
+    const ensureLightbox = () => {
+        let overlay = document.querySelector(".image-lightbox-overlay");
+        if (overlay) return overlay;
+
+        overlay = document.createElement("div");
+        overlay.className = "image-lightbox-overlay";
+        overlay.innerHTML = `
+            <button class="image-lightbox-close" type="button" aria-label="关闭预览">×</button>
+            <div class="image-lightbox-frame"><img alt="图片预览" /></div>
+        `;
+        document.body.appendChild(overlay);
+
+        const close = () => {
+            overlay.classList.remove("open");
+            document.body.classList.remove("image-lightbox-open");
+        };
+        overlay.addEventListener("click", (event) => {
+            if (
+                event.target === overlay ||
+                event.target.closest(".image-lightbox-close")
+            ) {
+                close();
+            }
+        });
+        document.addEventListener("keydown", (event) => {
+            if (event.key === "Escape" && overlay.classList.contains("open")) {
+                close();
+            }
+        });
+        return overlay;
+    };
+
+    const openLightbox = (src) => {
+        if (!src) return;
+        const overlay = ensureLightbox();
+        const img = overlay.querySelector("img");
+        img.src = src;
+        overlay.classList.add("open");
+        document.body.classList.add("image-lightbox-open");
+    };
+    window.openMattingLightbox = openLightbox;
+
+    document.addEventListener("click", (event) => {
+        const trigger = event.target.closest(".preview-open-btn");
+        if (!trigger) return;
+        const panel =
+            trigger.closest(".panel-card") ||
+            trigger.parentElement?.closest(".panel-card");
+        const images = Array.from(
+            panel?.querySelectorAll(".checkerboard img[src]") || []
+        ).filter((img) => img.currentSrc || img.src);
+        const image = images[images.length - 1];
+        if (!image?.src) return;
+
+        event.preventDefault();
+        event.stopPropagation();
+        openLightbox(image.currentSrc || image.src);
+    }, true);
+})();
+"""
+
+
 # ── build_ui() 构建界面 ─────────────────────────────────────────
 def build_ui():
     with gr.Blocks(title="全自动抠图") as demo:
@@ -503,7 +764,10 @@ def build_ui():
             with gr.Row():
                 # 左栏：控制面板
                 with gr.Column(scale=1, elem_classes="control-rail"):
-                    gr.Markdown('<div class="section-title">一键抠图</div>')
+                    gr.Markdown(
+                        '<div class="section-title">一键抠图 '
+                        '<span class="badge">RMBG-2.0</span></div>'
+                    )
 
                     detect_transparent = gr.Checkbox(
                         label="检测透明物体（玻璃/水滴等）",
@@ -520,12 +784,13 @@ def build_ui():
                         label="精修模型",
                         elem_classes="segment-control",
                     )
-                    process_mode = gr.Radio(
-                        choices=list(VITMATTE_PROCESS_MODES.keys()),
-                        value="条带",
-                        label="推理模式",
-                        elem_classes="segment-control",
-                    )
+                    with gr.Group(visible=False) as process_mode_group:
+                        process_mode = gr.Radio(
+                            choices=list(VITMATTE_PROCESS_MODES.keys()),
+                            value="条带",
+                            label="推理模式",
+                            elem_classes="segment-control",
+                        )
 
                     auto_status = gr.Textbox(
                         label="状态",
@@ -539,37 +804,53 @@ def build_ui():
                         elem_classes="btn-primary",
                     )
 
-                # 中栏：上传 + 原图预览
+                # 中栏：原图
                 with gr.Column(scale=4, elem_classes="panel-card"):
-                    gr.Markdown('<div class="section-title">原图</div>')
+                    gr.Markdown(
+                        '<div class="section-title">原图 '
+                        '<span class="section-hint">上传后在这里确认待处理图片</span></div>'
+                    )
                     auto_files = gr.File(
-                        label="上传图片（支持多张）",
+                        label="上传原图（支持多张）",
                         file_count="multiple",
                         file_types=["image"],
                         elem_classes="upload-area",
                     )
                     auto_input_img = gr.Image(
-                        label="预览",
+                        label="原图",
+                        visible=False,
                         interactive=False,
                         elem_classes="checkerboard",
                     )
+                    with gr.Row(elem_classes="preview-actions"):
+                        auto_input_view_btn = gr.Button(
+                            "查看大图",
+                            visible=False,
+                            elem_classes=["btn-secondary", "preview-open-btn"],
+                        )
                     auto_swap_btn = gr.Button(
-                        "换图",
+                        "清空原图区",
                         visible=False,
                         elem_classes="btn-secondary",
                     )
 
-                # 右栏：结果
+                # 右栏：效果预览
                 with gr.Column(scale=4, elem_classes="panel-card"):
                     gr.Markdown(
-                        '<div class="section-title">结果 '
+                        '<div class="section-title">效果预览 '
                         '<span class="badge">透明背景</span></div>'
                     )
                     auto_result_img = gr.Image(
-                        label="抠图结果",
+                        label="效果预览",
                         interactive=False,
                         elem_classes="checkerboard",
                     )
+                    with gr.Row(elem_classes="preview-actions"):
+                        auto_result_view_btn = gr.Button(
+                            "查看大图",
+                            visible=False,
+                            elem_classes=["btn-secondary", "preview-open-btn"],
+                        )
 
         # ==================== Tab 2: 精细选区 ====================
         with gr.Tab("精细选区"):
@@ -600,7 +881,10 @@ def build_ui():
                     )
 
                     # 文本定位 UI（条件显示）
-                    with gr.Group(visible=False) as text_locate_group:
+                    with gr.Group(
+                        visible=False,
+                        elem_classes="text-locate-panel",
+                    ) as text_locate_group:
                         text_caption = gr.Textbox(
                             label="物体描述",
                             placeholder="例: red car, person, glass bottle",
@@ -628,43 +912,54 @@ def build_ui():
                         elem_classes="btn-secondary",
                     )
 
-                # 中栏：上传 + 画布
+                # 中栏：原图
                 with gr.Column(scale=4, elem_classes="panel-card"):
                     gr.Markdown(
-                        '<div class="section-title">画布 '
-                        '<span class="badge">Canvas</span>'
-                        ' <span style="font-size:0.75em;color:var(--ink-muted);'
-                        'font-weight:400;margin-left:8px">'
+                        '<div class="section-title">原图 '
+                        '<span class="section-hint">'
                         '点击图片选取区域，绿色=正向，红色=负向</span></div>'
                     )
                     canvas_files = gr.File(
-                        label="上传图片",
+                        label="上传原图",
                         file_types=["image"],
                         elem_classes="upload-area",
                     )
                     canvas_img = gr.Image(
-                        label="画布",
+                        label="原图",
                         type="numpy",
+                        visible=False,
                         interactive=False,
                         elem_classes="checkerboard",
                     )
+                    with gr.Row(elem_classes="preview-actions"):
+                        canvas_view_btn = gr.Button(
+                            "查看大图",
+                            visible=False,
+                            elem_classes=["btn-secondary", "preview-open-btn"],
+                        )
                     canvas_swap_btn = gr.Button(
-                        "换图",
+                        "清空原图区",
                         visible=False,
                         elem_classes="btn-secondary",
                     )
 
-                # 右栏：结果
+                # 右栏：效果预览
                 with gr.Column(scale=4, elem_classes="panel-card"):
                     gr.Markdown(
-                        '<div class="section-title">结果 '
-                        '<span class="badge">Result</span></div>'
+                        '<div class="section-title">效果预览 '
+                        '<span class="badge">选区结果</span></div>'
                     )
                     result_img = gr.Image(
-                        label="抠图结果",
+                        label="效果预览",
                         interactive=False,
                         elem_classes="checkerboard",
                     )
+                    with gr.Row(elem_classes="preview-actions"):
+                        result_view_btn = gr.Button(
+                            "查看大图",
+                            visible=False,
+                            elem_classes=["btn-secondary", "preview-open-btn"],
+                        )
 
             # State
             points_state = gr.State([])
@@ -677,18 +972,34 @@ def build_ui():
         auto_files.upload(
             fn=on_auto_upload,
             inputs=[auto_files],
-            outputs=[auto_files, auto_input_img, auto_swap_btn],
+            outputs=[auto_files, auto_input_img, auto_input_view_btn,
+                     auto_swap_btn, auto_result_img, auto_result_view_btn,
+                     auto_status],
+            queue=False,
+            show_progress="hidden",
         )
         auto_swap_btn.click(
-            fn=on_auto_swap,
-            outputs=[auto_files, auto_input_img, auto_swap_btn],
+            fn=on_auto_clear_source,
+            outputs=[auto_files, auto_input_img, auto_input_view_btn,
+                     auto_swap_btn, auto_result_img, auto_result_view_btn,
+                     auto_status],
+            queue=False,
+            show_progress="hidden",
+        )
+        vitmatte_variant.change(
+            fn=on_vitmatte_variant_change,
+            inputs=[vitmatte_variant],
+            outputs=[process_mode_group],
+            queue=False,
+            show_progress="hidden",
         )
 
         auto_btn.click(
             fn=on_auto_process,
             inputs=[auto_files, detect_transparent, vitmatte_variant,
                     process_mode, save_debug],
-            outputs=[auto_input_img, auto_status, auto_result_img],
+            outputs=[auto_input_img, auto_status, auto_result_img,
+                     auto_result_view_btn],
             stream_every=0.5,
         )
 
@@ -697,48 +1008,66 @@ def build_ui():
             fn=lambda v: gr.update(visible=v),
             inputs=[use_text_locate],
             outputs=[text_locate_group],
+            queue=False,
+            show_progress="hidden",
+        )
+        engine_mode.change(
+            fn=on_engine_mode_change,
+            inputs=[canvas_img],
+            outputs=[result_img, result_view_btn, points_state, labels_state,
+                     box_state, cutout_status],
+            queue=False,
+            show_progress="hidden",
         )
 
         canvas_files.upload(
             fn=on_image_upload,
             inputs=[canvas_files],
-            outputs=[canvas_files, canvas_img, canvas_swap_btn,
-                     points_state, result_img, cutout_status],
+            outputs=[canvas_files, canvas_img, canvas_view_btn,
+                     canvas_swap_btn, result_view_btn, points_state,
+                     labels_state, box_state, result_img, cutout_status],
+            queue=False,
+            show_progress="hidden",
         )
         canvas_swap_btn.click(
-            fn=on_canvas_swap,
-            outputs=[canvas_files, canvas_img, canvas_swap_btn,
-                     points_state, labels_state, box_state],
+            fn=on_canvas_clear_source,
+            outputs=[canvas_files, canvas_img, canvas_view_btn,
+                     canvas_swap_btn, result_view_btn, points_state,
+                     labels_state, box_state, result_img, cutout_status],
+            queue=False,
+            show_progress="hidden",
         )
 
         locate_btn.click(
             fn=on_text_locate,
             inputs=[canvas_img, text_caption, engine_mode],
-            outputs=[result_img, points_state, labels_state, box_state,
-                     cutout_status],
+            outputs=[result_img, result_view_btn, points_state, labels_state,
+                     box_state, cutout_status],
         )
 
         canvas_img.select(
             fn=on_image_click,
             inputs=[canvas_img, click_mode, engine_mode,
                     points_state, labels_state, box_state],
-            outputs=[result_img, points_state, labels_state, box_state,
-                     cutout_status],
+            outputs=[result_img, result_view_btn, points_state, labels_state,
+                     box_state, cutout_status],
         )
 
         generate_btn.click(
             fn=on_generate_cutout,
             inputs=[canvas_img, engine_mode,
                     points_state, labels_state, box_state],
-            outputs=[result_img, cutout_status],
+            outputs=[result_img, result_view_btn, cutout_status],
             stream_every=0.5,
         )
 
         clear_btn.click(
             fn=on_clear_points,
             inputs=[canvas_img],
-            outputs=[canvas_img, points_state, labels_state, box_state,
-                     cutout_status],
+            outputs=[result_img, result_view_btn, points_state, labels_state,
+                     box_state, cutout_status],
+            queue=False,
+            show_progress="hidden",
         )
 
     return demo
@@ -755,6 +1084,7 @@ if __name__ == "__main__":
         prevent_thread_lock=True,
         theme=gr.themes.Soft(),
         css=APP_CSS,
+        js=APP_JS,
     )
 
     # 信号处理

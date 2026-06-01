@@ -231,6 +231,15 @@ class ModelManager:
             self._grounding_dino_engine = None
             clear_gpu_cache()
 
+    def unload_vitmatte(self):
+        """卸载 ViTMatte 释放显存"""
+        if self._vitmatte_engine is not None:
+            self._vitmatte_engine.cleanup()
+            del self._vitmatte_engine
+            self._vitmatte_engine = None
+            self._vitmatte_variant = None
+            clear_gpu_cache()
+
     def unload_sam(self):
         """卸载 SAM 引擎释放内存"""
         if self._sam_engine is not None:
