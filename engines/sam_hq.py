@@ -5,7 +5,6 @@ SAM-HQ 引擎：交互式点击分割 + 实时蒙版（高质量边缘）
 import os
 import numpy as np
 import cv2
-from PIL import Image
 
 
 class SAMHQEngine:
@@ -154,22 +153,6 @@ class SAMHQEngine:
             cv2.circle(img, (x, y), 8, color, -1)
             cv2.circle(img, (x, y), 8, (255, 255, 255), 2)
         return img
-
-    def apply_mask_to_image(
-        self,
-        image: np.ndarray,
-        point_coords: list,
-        point_labels: list,
-        refiner,
-        transparent_detector=None,
-        box=None,
-    ) -> Image.Image:
-        """SAM 二值 mask → ViTMatte 精修 → RGBA"""
-        mask = self.predict_mask(point_coords, point_labels, box=box)
-        binary_alpha = (mask.astype(np.uint8) * 255)
-        alpha = refiner.refine(image, binary_alpha, transparent_detector=transparent_detector)
-        rgba = np.dstack([image, alpha])
-        return Image.fromarray(rgba, "RGBA")
 
     def cleanup(self):
         """释放资源"""

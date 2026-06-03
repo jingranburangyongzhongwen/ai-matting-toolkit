@@ -2,6 +2,7 @@
 RMBG-2.0 引擎：自动抠图，配合 ViTMatte 做边缘精细化
 """
 import time
+import threading
 
 import cv2
 import numpy as np
@@ -9,28 +10,34 @@ import torch
 from PIL import Image
 from transformers import AutoModelForImageSegmentation
 
+from .rgba_postprocess import make_clean_rgba
+
 
 class RMBG2Engine:
     def __init__(self, model_path: str, device: str = "cpu"):
         self.device = device
         self.model = None
         self.model_path = model_path
+        self._load_lock = threading.Lock()
 
     def _load_model(self):
         if self.model is not None:
             return
-        print(f"[RMBG-2.0] 加载模型到 {self.device} ...")
-        self.model = AutoModelForImageSegmentation.from_pretrained(
-            self.model_path,
-            trust_remote_code=True,
-        )
-        self.model.to(self.device)
-        self.model.eval()
-        if torch.cuda.is_available():
-            allocated = torch.cuda.memory_allocated() / 1024**3
-            reserved = torch.cuda.memory_reserved() / 1024**3
-            print(f"[VRAM] RMBG-2.0 loaded — allocated: {allocated:.2f}GB, reserved: {reserved:.2f}GB")
-        print("[RMBG-2.0] 模型加载完成")
+        with self._load_lock:
+            if self.model is not None:
+                return
+            print(f"[RMBG-2.0] loading model on {self.device} ...")
+            self.model = AutoModelForImageSegmentation.from_pretrained(
+                self.model_path,
+                trust_remote_code=True,
+            )
+            self.model.to(self.device)
+            self.model.eval()
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated() / 1024**3
+                reserved = torch.cuda.memory_reserved() / 1024**3
+                print(f"[VRAM] RMBG-2.0 loaded - allocated: {allocated:.2f}GB, reserved: {reserved:.2f}GB")
+            print("[RMBG-2.0] model loaded")
 
     def remove_background(self, image: Image.Image, refiner, transparent_detector=None,
                           refine_mode: str = "auto", debug_dir: str = None) -> Image.Image:
@@ -59,26 +66,49 @@ class RMBG2Engine:
             import os
             os.makedirs(debug_dir, exist_ok=True)
             self._dump_stats("RMBG原始", mask_raw)
-            Image.fromarray(mask_raw, "L").save(os.path.join(debug_dir, "1_rmbg_raw.png"))
+            Image.fromarray(mask_raw, "L").save(os.path.join(debug_dir, "10_rmbg_raw_alpha.png"))
             self._dump_stats("RMBG清理后", mask_clean)
+            Image.fromarray(mask_clean, "L").save(os.path.join(debug_dir, "11_rmbg_clean_alpha.png"))
             self._dump_stats("RMBG平滑后", mask)
+            Image.fromarray(mask, "L").save(os.path.join(debug_dir, "12_rmbg_smooth_alpha.png"))
 
         if refiner is not None:
-            trimap = refiner._make_trimap(mask, soft=True,
-                                           erode=refiner._trimap_erode,
-                                           dilate=refiner._trimap_dilate)
-            if debug_dir:
-                self._dump_trimap(trimap)
             mask = refiner.refine(image, mask, transparent_detector=transparent_detector,
                                   soft=True, mode=refine_mode, _debug_dir=debug_dir)
 
         if debug_dir:
-            self._dump_stats("最终alpha", mask)
-            Image.fromarray(mask, "L").save(os.path.join(debug_dir, "5_final_alpha.png"))
+            self._dump_stats("后处理输入alpha", mask)
             print(f"[诊断] 中间结果已保存到: {debug_dir}")
 
-        rgba = np.dstack([img_array, mask])
+        rgba = make_clean_rgba(
+            img_array,
+            mask,
+            debug_dir=debug_dir,
+            preserve_transparency=(transparent_detector is not None),
+        )
         return Image.fromarray(rgba, "RGBA")
+
+    def predict_alpha(self, image: Image.Image, clean: bool = True,
+                      smooth: bool = True) -> np.ndarray:
+        """返回 RMBG soft alpha，供交互式 ROI 抠图流程做约束融合。"""
+        self._load_model()
+
+        img_input = self._preprocess(image)
+        t0 = time.perf_counter()
+        with torch.inference_mode():
+            if self.device == "cuda":
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    result = self.model(img_input)
+            else:
+                result = self.model(img_input)
+        print(f"[RMBG-2.0] ROI 推理耗时 {time.perf_counter() - t0:.2f}s")
+
+        alpha = self._postprocess(result, image.size)
+        if clean:
+            alpha = self._clean_mask(alpha)
+        if smooth:
+            alpha = self._smooth_edge(alpha, np.array(image.convert("RGB")))
+        return alpha
 
     def _preprocess(self, image: Image.Image) -> torch.Tensor:
         import torchvision.transforms.functional as TF
@@ -120,41 +150,48 @@ class RMBG2Engine:
               f"mean={mean_a:.0f} edge_std={edge_std:.1f} | 最大前景连通域={largest}px")
 
     @staticmethod
-    def _dump_trimap(trimap: np.ndarray):
-        total = trimap.size
-        bg = np.sum(trimap == 0) / total * 100
-        unk = np.sum(trimap == 127) / total * 100
-        fg = np.sum(trimap == 255) / total * 100
-        # unknown 区连通域数量（太多说明 trimap 碎片化）
-        n, _, stats, _ = cv2.connectedComponentsWithStats((trimap == 127).astype(np.uint8))
-        print(f"[诊断] Trimap: bg={bg:.1f}% unknown={unk:.1f}% fg={fg:.1f}% | "
-              f"unknown连通域={n-1}个 | unknown面积: min={stats[1:, cv2.CC_STAT_AREA].min() if n>1 else 0} "
-              f"max={stats[1:, cv2.CC_STAT_AREA].max() if n>1 else 0}")
-
-    @staticmethod
     def _clean_mask(alpha: np.ndarray) -> np.ndarray:
-        """连通域清理：去除前景噪点 + 填充内部空洞，阈值按图片面积自适应"""
+        """连通域清理：去除前景噪点和孤立淡残影，保留内部背景空隙。"""
         h, w = alpha.shape
         total = h * w
         # 阈值：噪点 < 图片面积的 0.02%（1080p≈460px, 4K≈1840px）
-        # 空洞 < 图片面积的 0.05%
         noise_thresh = max(50, int(total * 0.0002))
-        hole_thresh = max(100, int(total * 0.0005))
+        # 极低 alpha 在合成时容易变成脏边/残影，直接归零。
+        haze_floor = 10
+        # 孤立淡残影面积阈值，主要清掉没有实心主体支撑的小片 alpha。
+        haze_area_thresh = max(200, int(total * 0.001))
+
+        alpha[alpha < haze_floor] = 0
 
         bin_mask = (alpha > 127).astype(np.uint8)
 
         # 去噪点：删除面积 < noise_thresh 的前景连通域
-        n, labels, stats, _ = cv2.connectedComponentsWithStats(bin_mask)
-        for i in range(1, n):
-            if stats[i, cv2.CC_STAT_AREA] < noise_thresh:
-                alpha[labels == i] = 0
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(bin_mask, connectivity=8)
+        noise_labels = [
+            i for i in range(1, n)
+            if stats[i, cv2.CC_STAT_AREA] < noise_thresh
+        ]
+        if noise_labels:
+            alpha[np.isin(labels, noise_labels)] = 0
 
-        # 填空洞：填充面积 < hole_thresh 的背景连通域（排除最外层背景）
-        inverted = 1 - bin_mask
-        n, labels, stats, _ = cv2.connectedComponentsWithStats(inverted)
+        # 清掉没有实心前景支撑的孤立淡 alpha；边缘和发丝若连着主体会保留。
+        solid_mask = alpha > 127
+        if not np.any(solid_mask):
+            return alpha
+
+        support_mask = (alpha > haze_floor).astype(np.uint8)
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(support_mask, connectivity=8)
+        solid_labels = set(np.unique(labels[solid_mask]).tolist())
+        haze_labels = []
         for i in range(1, n):
-            if stats[i, cv2.CC_STAT_AREA] < hole_thresh:
-                alpha[labels == i] = 255
+            if i in solid_labels:
+                continue
+            vals = alpha[labels == i]
+            area = stats[i, cv2.CC_STAT_AREA]
+            if area < haze_area_thresh or vals.max() < 120 or vals.mean() < 64:
+                haze_labels.append(i)
+        if haze_labels:
+            alpha[np.isin(labels, haze_labels)] = 0
 
         return alpha
 
@@ -164,10 +201,10 @@ class RMBG2Engine:
         边缘平滑：只模糊边缘过渡区（10<alpha<245），前景/背景核心区不动。
         避免模糊前景表面产生光晕。
         """
-        blurred = cv2.GaussianBlur(alpha.astype(np.float32), (5, 5), 0)
-        edge = (alpha > 10) & (alpha < 245)
+        blurred = cv2.GaussianBlur(alpha.astype(np.float32), (3, 3), 0)
+        edge = (alpha > 32) & (alpha < 224)
         result = alpha.astype(np.float32)
-        result[edge] = blurred[edge]
+        result[edge] = result[edge] * 0.65 + blurred[edge] * 0.35
         return np.clip(result, 0, 255).astype(np.uint8)
 
     def cleanup(self):

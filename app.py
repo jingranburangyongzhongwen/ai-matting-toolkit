@@ -1,5 +1,6 @@
 # ── 导入和全局初始化 ─────────────────────────────────────────────
-import gc, hashlib, os, warnings, signal, time
+import gc, hashlib, os, warnings, signal, time, threading
+import cv2
 import gradio as gr
 import numpy as np
 from PIL import Image
@@ -12,6 +13,7 @@ from model_manager import (
     ModelManager, free_vram_gb, get_base_path, get_output_path,
     VITMATTE_VARIANTS, VITMATTE_PROCESS_MODES,
 )
+from engines.rgba_postprocess import make_clean_rgba
 
 os.environ["HF_HOME"] = os.path.join(get_base_path(), "models", "cache")
 mgr = ModelManager()
@@ -25,6 +27,24 @@ ENGINE_MODE_MAP = {
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}
 
 
+def start_default_model_warmup():
+    """Warm up the default RMBG path without blocking the UI server."""
+    if os.environ.get("MATTING_PRELOAD_RMBG", "1") == "0":
+        return None
+
+    def _worker():
+        t0 = time.perf_counter()
+        try:
+            mgr.preload_rmbg2()
+            print(f"[startup warmup] RMBG-2.0 ready in {time.perf_counter() - t0:.2f}s")
+        except Exception as exc:
+            print(f"[startup warmup] RMBG-2.0 failed: {exc}")
+
+    thread = threading.Thread(target=_worker, name="rmbg2-warmup", daemon=True)
+    thread.start()
+    return thread
+
+
 # ── Tab 1 后端：一键抠图 ────────────────────────────────────────
 def _unload_sam_and_reset_state():
     """卸载 SAM 并同步清空本模块维护的图像指纹。"""
@@ -33,11 +53,15 @@ def _unload_sam_and_reset_state():
     _SAM_IMAGE_FINGERPRINT = None
 
 
-def on_auto_process(files, detect_transparent, vitmatte_variant, process_mode,
-                    save_debug=False):
+def on_auto_process(files, source_img, detect_transparent, vitmatte_variant,
+                    process_mode, save_debug=False):
     """generator，yield (preview_img, status_text, result_img, result_view_btn)"""
     if not files:
-        yield None, "请先上传图片", None, gr.update(visible=False)
+        # 原图区没有内容时完全不改动界面。
+        yield gr.update(), gr.update(), gr.update(), gr.update()
+        return
+    if not _has_source_content(source_img):
+        yield gr.update(), "请等待原图预览加载完成", gr.update(), gr.update()
         return
 
     # 映射 ViTMatte 变体
@@ -49,7 +73,7 @@ def on_auto_process(files, detect_transparent, vitmatte_variant, process_mode,
     needs_dino = bool(detect_transparent)
     low_vram = free_vram_gb() < KEEP_RESIDENT_FREE_GB
 
-    # RMBG-2.0 也需要推理显存；低显存时始终释放本次不会使用的常驻模型。
+    # 一键抠图必走 RMBG-2.0；低显存时只释放本次不会使用的常驻模型。
     if low_vram:
         _unload_sam_and_reset_state()
         if not needs_dino:
@@ -63,15 +87,15 @@ def on_auto_process(files, detect_transparent, vitmatte_variant, process_mode,
             mgr.switch_vitmatte(variant_key)
             refiner = mgr.vitmatte
         except FileNotFoundError as e:
-            yield None, f"模型加载失败: {e}", None, gr.update(visible=False)
+            yield gr.update(), f"模型加载失败: {e}", gr.update(), gr.update(visible=False)
             return
-        yield None, f"ViTMatte ({variant_key}) 已加载", None, gr.update(visible=False)
+        yield gr.update(), f"ViTMatte ({variant_key}) 已加载", gr.update(), gr.update(visible=False)
 
     # 透明物体检测器
     detector = None
     if detect_transparent:
         detector = mgr.grounding_dino
-        yield None, "Grounding-DINO 已加载，开始处理...", None, gr.update(visible=False)
+        yield gr.update(), "Grounding-DINO 已加载，开始处理...", gr.update(), gr.update(visible=False)
 
     output_dir = get_output_path()
     total = len(files)
@@ -85,20 +109,29 @@ def on_auto_process(files, detect_transparent, vitmatte_variant, process_mode,
             continue
 
         fname = os.path.basename(str(f))
-        yield None, f"[{idx + 1}/{total}] 正在处理: {fname}", last_result, gr.update(visible=(last_result is not None))
+        # 只更新状态文字；原图/结果图保持现状，避免无谓的全图重编码重传。
+        yield gr.update(), f"[{idx + 1}/{total}] 正在处理: {fname}", gr.update(), gr.update(visible=(last_result is not None))
 
         try:
             img = Image.open(f).convert("RGB")
         except Exception:
             continue
 
-        # 调试目录
-        debug_dir = None
-        if save_debug:
-            debug_dir = os.path.join(output_dir, os.path.splitext(fname)[0] + "_debug")
+        # 先确定唯一输出路径，调试目录据此对齐，避免重跑同名图覆盖旧结果
+        base, ext_out = os.path.splitext(fname)
+        out_path = os.path.join(output_dir, base + ".png")
+        counter = 1
+        while os.path.exists(out_path) or (
+            save_debug and os.path.isdir(os.path.splitext(out_path)[0] + "_debug")
+        ):
+            out_path = os.path.join(output_dir, f"{base}_{counter}.png")
+            counter += 1
+
+        debug_dir = os.path.splitext(out_path)[0] + "_debug" if save_debug else None
 
         last_original = np.array(img)
-        yield last_original, f"[{idx + 1}/{total}] RMBG-2.0 推理中: {fname}", last_result, gr.update(visible=(last_result is not None))
+        # 原图只在这里传一次。
+        yield last_original, f"[{idx + 1}/{total}] RMBG-2.0 推理中: {fname}", gr.update(), gr.update(visible=(last_result is not None))
 
         result = mgr.rmbg2.remove_background(
             img,
@@ -108,17 +141,11 @@ def on_auto_process(files, detect_transparent, vitmatte_variant, process_mode,
             debug_dir=debug_dir,
         )
 
-        # 保存到 output/，自动加后缀避免覆盖
-        base, ext_out = os.path.splitext(fname)
-        out_path = os.path.join(output_dir, base + ".png")
-        counter = 1
-        while os.path.exists(out_path):
-            out_path = os.path.join(output_dir, f"{base}_{counter}.png")
-            counter += 1
         result.save(out_path)
 
         last_result = result
-        yield np.array(img), f"[{idx + 1}/{total}] 完成: {fname} → {os.path.basename(out_path)}", result, gr.update(visible=True)
+        # 结果图只在这里传一次；原图不重传。
+        yield gr.update(), f"[{idx + 1}/{total}] 完成: {fname} → {os.path.basename(out_path)}", result, gr.update(visible=True)
 
         # 清理
         del img
@@ -127,9 +154,10 @@ def on_auto_process(files, detect_transparent, vitmatte_variant, process_mode,
 
     if last_result is not None:
         done_msg = f"全部完成，共处理 {total} 张，结果保存在 output/"
-        yield last_original, done_msg, last_result, gr.update(visible=True)
+        # 汇总只更新状态文字；图片已展示，不再重传。
+        yield gr.update(), done_msg, gr.update(), gr.update(visible=True)
     else:
-        yield last_original, "没有有效图片被处理", None, gr.update(visible=False)
+        yield gr.update(), "没有有效图片被处理", gr.update(), gr.update(visible=False)
 
 
 def on_auto_upload(files):
@@ -157,6 +185,24 @@ def on_auto_clear_source():
         gr.update(visible=False), "请先上传图片"
 
 
+def _has_source_content(source):
+    """判断原图区是否已有内容，避免 numpy 数组触发布尔歧义。"""
+    if source is None:
+        return False
+    if isinstance(source, np.ndarray):
+        return source.size > 0
+    if isinstance(source, (list, tuple, set)):
+        return len(source) > 0
+    return True
+
+
+def clear_result_preview_on_start(source, result):
+    """点击开始时快速清空旧预览；无原图或无旧预览则保持界面不变。"""
+    if not _has_source_content(source) or result is None:
+        return gr.update(), gr.update()
+    return None, gr.update(visible=False)
+
+
 def on_vitmatte_variant_change(vitmatte_variant):
     """直出不需要 ViTMatte 推理模式；只在精修模型启用时显示。"""
     variant_key = VITMATTE_VARIANTS.get(vitmatte_variant, "none")
@@ -182,10 +228,25 @@ def _reset_sam_interaction_state():
     mgr.sam._cached_mask = None
 
 
-def _ensure_sam_ready(image, engine_mode):
+def _unload_unused_for_tab2_sam_hq(keep_grounding_dino=False):
+    """SAM-HQ 低显存准备：只释放 Tab 2 后续不会马上用到的模型。"""
+    if free_vram_gb() >= KEEP_RESIDENT_FREE_GB:
+        return
+
+    # Tab 2 最终生成必走 RMBG-2.0，不能在这里卸载后又马上重载。
+    mgr.unload_vitmatte()
+    if not keep_grounding_dino:
+        mgr.unload_grounding_dino()
+
+
+def _ensure_sam_ready(image, engine_mode, keep_grounding_dino=False):
     """确保 SAM 引擎就绪，返回是否切换了引擎"""
     global _SAM_IMAGE_FINGERPRINT
     engine_type = ENGINE_MODE_MAP.get(engine_mode, "mobile_sam")
+    if engine_type == "sam_hq":
+        _unload_unused_for_tab2_sam_hq(
+            keep_grounding_dino=keep_grounding_dino
+        )
     switched = mgr.switch_sam(engine_type)
     fingerprint = _image_fingerprint(image)
     if switched or not mgr.sam._image_set or fingerprint != _SAM_IMAGE_FINGERPRINT:
@@ -226,7 +287,7 @@ def on_canvas_clear_source():
         [], [], None, None, "请先上传图片"
 
 
-def on_image_click(image, evt: gr.SelectData, mode, engine_mode,
+def on_image_click(image, evt: gr.SelectData, mode, engine_mode, text_locate_enabled,
                    points_state, labels_state, box_state):
     if image is None:
         return image, gr.update(visible=False), points_state, labels_state, box_state, "请先上传图片"
@@ -240,7 +301,11 @@ def on_image_click(image, evt: gr.SelectData, mode, engine_mode,
     new_labels = list(labels_state) + [label]
 
     try:
-        _ensure_sam_ready(image, engine_mode)
+        _ensure_sam_ready(
+            image,
+            engine_mode,
+            keep_grounding_dino=bool(text_locate_enabled),
+        )
         overlay = mgr.sam.predict_and_overlay(
             image, new_points, new_labels, box=box_state
         )
@@ -258,7 +323,7 @@ def on_text_locate(image, caption, engine_mode):
         return image, gr.update(visible=False), [], [], None, "请输入定位描述"
 
     try:
-        _ensure_sam_ready(image, engine_mode)
+        _ensure_sam_ready(image, engine_mode, keep_grounding_dino=True)
         _reset_sam_interaction_state()
         caption_for_dino = caption.strip()
         if not caption_for_dino.endswith("."):
@@ -290,11 +355,194 @@ def on_text_locate(image, caption, engine_mode):
         return image, gr.update(visible=False), [], [], None, f"定位失败: {e}"
 
 
+def _odd_kernel(value, min_value, max_value):
+    """返回 OpenCV 形态学/模糊操作需要的奇数核大小。"""
+    value = int(np.clip(int(value), min_value, max_value))
+    return value if value % 2 == 1 else value + 1
+
+
+def _mask_bbox(mask: np.ndarray, image_shape, fallback_box=None):
+    """从 SAM mask 取主体 bbox；无 mask 时退回文本定位框。"""
+    h, w = image_shape[:2]
+    ys, xs = np.where(mask > 0)
+    if ys.size == 0:
+        if fallback_box is None:
+            return None
+        x1, y1, x2, y2 = fallback_box
+        return [max(0, int(x1)), max(0, int(y1)),
+                min(w, int(x2)), min(h, int(y2))]
+    return [int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1]
+
+
+def _pad_bbox(box, image_shape, ratio=0.25, min_pad=96):
+    """给 RMBG ROI 保留足够背景上下文，避免边界截断和指缝误判。"""
+    h, w = image_shape[:2]
+    x1, y1, x2, y2 = [int(round(v)) for v in box]
+    bw = max(1, x2 - x1)
+    bh = max(1, y2 - y1)
+    pad = max(min_pad, int(max(bw, bh) * ratio))
+    return [
+        max(0, x1 - pad),
+        max(0, y1 - pad),
+        min(w, x2 + pad),
+        min(h, y2 + pad),
+    ]
+
+
+def _bbox_margin_to_image_edge(box, image_shape):
+    """计算 bbox 到图像边界的最近距离，用于判断 ROI 是否太紧。"""
+    h, w = image_shape[:2]
+    x1, y1, x2, y2 = [int(v) for v in box]
+    return min(x1, y1, w - x2, h - y2)
+
+
+def _roi_alpha_touches_border(alpha: np.ndarray) -> bool:
+    """只有明显前景贴着 ROI 边缘时，才认为裁剪上下文不足。"""
+    if alpha.size == 0:
+        return False
+    h, w = alpha.shape
+    band = max(4, min(24, min(h, w) // 32))
+    border = np.concatenate([
+        alpha[:band, :].ravel(),
+        alpha[-band:, :].ravel(),
+        alpha[:, :band].ravel(),
+        alpha[:, -band:].ravel(),
+    ])
+    if border.size == 0:
+        return False
+    strong_ratio = np.mean(border > 0.75)
+    solid_ratio = np.mean(border > 0.5)
+    return strong_ratio > 0.01 or solid_ratio > 0.03
+
+
+def _build_sam_constraints(sam_mask: np.ndarray, bbox, image_shape):
+    """
+    SAM 只提供主体范围先验：原始 mask 内不压暗 RMBG，外扩软边内渐隐，
+    大外扩外强制清零。
+    """
+    h, w = image_shape[:2]
+    x1, y1, x2, y2 = [int(v) for v in bbox]
+    base_dim = max(1, min(x2 - x1, y2 - y1))
+
+    sam_u8 = ((sam_mask > 0).astype(np.uint8) * 255)
+
+    soft_k = _odd_kernel(base_dim * 0.04, 15, 101)
+    blur_k = _odd_kernel(base_dim * 0.06, 21, 151)
+    soft_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (soft_k, soft_k))
+    soft = cv2.dilate(sam_u8, soft_kernel)
+    soft = cv2.GaussianBlur(soft, (blur_k, blur_k), 0).astype(np.float32) / 255.0
+    soft[sam_mask > 0] = 1.0
+
+    allow_k = _odd_kernel(base_dim * 0.08, 31, 181)
+    allow_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (allow_k, allow_k))
+    hard_allow = cv2.dilate(sam_u8, allow_kernel) > 0
+
+    # RMBG 高置信豁免只给 SAM 原 mask 和非常贴近边缘的窄带，
+    # 避免 ROI 内第二主体绕过 soft_constraint 被带出来。
+    recover_k = _odd_kernel(base_dim * 0.018, 7, 41)
+    recover_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (recover_k, recover_k),
+    )
+    recover_allow = cv2.dilate(sam_u8, recover_kernel) > 0
+
+    return np.clip(soft, 0.0, 1.0), hard_allow, recover_allow
+
+
+def _apply_negative_points(alpha: np.ndarray, points, labels, bbox):
+    """负向点优先级最高：在用户明确排除区域做局部软擦除。"""
+    negative_points = [pt for pt, label in zip(points, labels) if label == 0]
+    if not negative_points:
+        return alpha
+
+    x1, y1, x2, y2 = [int(v) for v in bbox]
+    base_dim = max(1, min(x2 - x1, y2 - y1))
+    radius = int(np.clip(base_dim * 0.025, 12, 48))
+    blur = _odd_kernel(radius * 2 + 1, 25, 129)
+
+    erase = np.zeros(alpha.shape, dtype=np.float32)
+    for x, y in negative_points:
+        cv2.circle(erase, (int(round(x)), int(round(y))), radius, 1.0, -1)
+    erase = cv2.GaussianBlur(erase, (blur, blur), 0)
+    erase = np.clip(erase, 0.0, 1.0)
+    return alpha * (1.0 - erase)
+
+
+def _make_rgba_result(image: np.ndarray, alpha: np.ndarray, debug_dir: str = None,
+                      preserve_transparency: bool = False) -> np.ndarray:
+    """生成可换任意背景的干净 RGBA，避免两侧 Tab 出口逻辑分叉。"""
+    return make_clean_rgba(
+        image,
+        alpha,
+        debug_dir=debug_dir,
+        preserve_transparency=preserve_transparency,
+    )
+
+
+def _sam_guided_rmbg_alpha(image: np.ndarray, sam_mask: np.ndarray,
+                           points_state, labels_state, box_state):
+    """商业级 Tab 2 融合：SAM 选主体，RMBG 在 ROI 内决定最终 alpha。"""
+    h, w = image.shape[:2]
+    subject_box = _mask_bbox(sam_mask, image.shape, fallback_box=box_state)
+    if subject_box is None:
+        raise ValueError("SAM 未得到有效主体区域")
+
+    quality_notes = []
+
+    roi_box = _pad_bbox(subject_box, image.shape, ratio=0.32, min_pad=128)
+    x1, y1, x2, y2 = roi_box
+    if x2 <= x1 or y2 <= y1:
+        raise ValueError("ROI 无效，请重新标记主体")
+
+    roi_img = Image.fromarray(image[y1:y2, x1:x2].astype(np.uint8), "RGB")
+    roi_alpha = mgr.rmbg2.predict_alpha(roi_img, clean=True, smooth=True).astype(np.float32) / 255.0
+
+    # 只在明确裁切到前景时扩大一次，避免为了极端情况牺牲交互速度。
+    if _roi_alpha_touches_border(roi_alpha):
+        if _bbox_margin_to_image_edge(roi_box, image.shape) <= 1:
+            quality_notes.append("主体接近图像边缘")
+        else:
+            expanded_box = _pad_bbox(subject_box, image.shape, ratio=0.50, min_pad=224)
+            if expanded_box != roi_box:
+                ex1, ey1, ex2, ey2 = expanded_box
+                expanded_img = Image.fromarray(image[ey1:ey2, ex1:ex2].astype(np.uint8), "RGB")
+                roi_alpha = (
+                    mgr.rmbg2.predict_alpha(expanded_img, clean=True, smooth=True).astype(np.float32) / 255.0
+                )
+                roi_box = expanded_box
+                quality_notes.append("ROI自动扩边")
+
+    x1, y1, x2, y2 = roi_box
+
+    full_alpha = np.zeros((h, w), dtype=np.float32)
+    full_alpha[y1:y2, x1:x2] = roi_alpha[:y2 - y1, :x2 - x1]
+
+    soft_constraint, hard_allow, recover_allow = _build_sam_constraints(
+        sam_mask,
+        subject_box,
+        image.shape,
+    )
+    final_alpha = np.minimum(full_alpha, soft_constraint)
+
+    # 高置信 RMBG 只能在 SAM 原 mask/窄边缘带内豁免，避免抠出 ROI 内其他主体。
+    high_conf = (full_alpha > 0.95) & recover_allow
+    final_alpha[high_conf] = full_alpha[high_conf]
+    final_alpha[~hard_allow] = 0.0
+
+    final_alpha = _apply_negative_points(final_alpha, points_state, labels_state, subject_box)
+    final_alpha = np.clip(final_alpha, 0.0, 1.0)
+    return (final_alpha * 255).round().astype(np.uint8), subject_box, roi_box, quality_notes
+
+
 def on_generate_cutout(image, engine_mode, points_state,
-                       labels_state, box_state):
+                       labels_state, box_state, preserve_transparency=False,
+                       save_debug=False):
     """generator，yield (result_img, result_view_btn, status_text)"""
-    if image is None or (not points_state and box_state is None):
-        yield None, gr.update(visible=False), "请先上传图片并标记区域"
+    if image is None:
+        yield gr.update(), gr.update(), gr.update()
+        return
+    if not points_state and box_state is None:
+        yield gr.update(), gr.update(), "请先标记区域或用文本定位"
         return
 
     try:
@@ -305,22 +553,47 @@ def on_generate_cutout(image, engine_mode, points_state,
             mask = mgr.sam._cached_mask
         else:
             mask = mgr.sam.predict_mask(points_state, labels_state, box=box_state)
-        alpha = (mask.astype(np.uint8) * 255)
-        rgba = np.dstack([image, alpha])
-        result = Image.fromarray(rgba, "RGBA")
 
+        # 商业级融合：SAM 负责主体先验，RMBG 在扩边 ROI 内重新判断精细 alpha。
+        yield gr.update(), gr.update(), "RMBG-2.0 ROI 精修中..."
+        alpha, subject_box, roi_box, quality_notes = _sam_guided_rmbg_alpha(
+            image, mask, points_state, labels_state, box_state
+        )
         # 保存到 output/
         output_dir = get_output_path()
         out_path = os.path.join(output_dir, "cutout.png")
         counter = 1
-        while os.path.exists(out_path):
+        while os.path.exists(out_path) or (
+            save_debug and os.path.isdir(os.path.splitext(out_path)[0] + "_debug")
+        ):
             out_path = os.path.join(output_dir, f"cutout_{counter}.png")
             counter += 1
+
+        debug_dir = os.path.splitext(out_path)[0] + "_debug" if save_debug else None
+        rgba = _make_rgba_result(
+            image,
+            alpha,
+            debug_dir=debug_dir,
+            preserve_transparency=bool(preserve_transparency),
+        )
+        result = Image.fromarray(rgba, "RGBA")
         result.save(out_path)
 
-        yield result, gr.update(visible=True), f"完成！已保存到 {os.path.basename(out_path)}"
+        sx1, sy1, sx2, sy2 = subject_box
+        rx1, ry1, rx2, ry2 = roi_box
+        notes = list(quality_notes)
+        if preserve_transparency:
+            notes.append("透明材质保护")
+        if save_debug:
+            notes.append(f"诊断目录: {os.path.basename(debug_dir)}")
+        note_text = f"\n质量保护: {'、'.join(sorted(set(notes)))}" if notes else ""
+        yield result, gr.update(visible=True), (
+            f"完成！已保存到 {os.path.basename(out_path)}\n"
+            f"SAM主体框: [{sx1},{sy1},{sx2},{sy2}]，RMBG扩边ROI: [{rx1},{ry1},{rx2},{ry2}]"
+            f"{note_text}"
+        )
     except Exception as e:
-        yield None, gr.update(visible=False), f"生成失败: {e}"
+        yield gr.update(), gr.update(), f"生成失败: {e}"
 
 
 def on_clear_points(image):
@@ -879,6 +1152,14 @@ def build_ui():
                         label="启用文本定位",
                         value=False,
                     )
+                    canvas_preserve_transparency = gr.Checkbox(
+                        label="保护透明/半透明材质",
+                        value=False,
+                    )
+                    canvas_save_debug = gr.Checkbox(
+                        label="保存诊断中间结果",
+                        value=False,
+                    )
 
                     # 文本定位 UI（条件显示）
                     with gr.Group(
@@ -995,9 +1276,16 @@ def build_ui():
         )
 
         auto_btn.click(
+            fn=clear_result_preview_on_start,
+            inputs=[auto_input_img, auto_result_img],
+            outputs=[auto_result_img, auto_result_view_btn],
+            queue=False,
+            show_progress="hidden",
+        )
+        auto_btn.click(
             fn=on_auto_process,
-            inputs=[auto_files, detect_transparent, vitmatte_variant,
-                    process_mode, save_debug],
+            inputs=[auto_files, auto_input_img, detect_transparent,
+                    vitmatte_variant, process_mode, save_debug],
             outputs=[auto_input_img, auto_status, auto_result_img,
                      auto_result_view_btn],
             stream_every=0.5,
@@ -1047,16 +1335,24 @@ def build_ui():
 
         canvas_img.select(
             fn=on_image_click,
-            inputs=[canvas_img, click_mode, engine_mode,
+            inputs=[canvas_img, click_mode, engine_mode, use_text_locate,
                     points_state, labels_state, box_state],
             outputs=[result_img, result_view_btn, points_state, labels_state,
                      box_state, cutout_status],
         )
 
         generate_btn.click(
+            fn=clear_result_preview_on_start,
+            inputs=[canvas_img, result_img],
+            outputs=[result_img, result_view_btn],
+            queue=False,
+            show_progress="hidden",
+        )
+        generate_btn.click(
             fn=on_generate_cutout,
             inputs=[canvas_img, engine_mode,
-                    points_state, labels_state, box_state],
+                    points_state, labels_state, box_state,
+                    canvas_preserve_transparency, canvas_save_debug],
             outputs=[result_img, result_view_btn, cutout_status],
             stream_every=0.5,
         )
@@ -1086,6 +1382,8 @@ if __name__ == "__main__":
         css=APP_CSS,
         js=APP_JS,
     )
+    start_default_model_warmup()
+
 
     # 信号处理
     def _force_exit(*_):

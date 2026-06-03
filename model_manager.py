@@ -4,7 +4,12 @@
 import gc
 import os
 import sys
-import torch
+import threading
+
+
+def _torch():
+    import torch
+    return torch
 
 
 def get_base_path():
@@ -28,6 +33,7 @@ def get_output_path():
 
 def get_device():
     """检测可用设备：CUDA > MPS (Apple Silicon) > CPU"""
+    torch = _torch()
     if torch.cuda.is_available():
         return "cuda"
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -37,6 +43,7 @@ def get_device():
 
 def free_vram_gb() -> float:
     """当前 GPU 实际空闲显存(GB，含其它进程占用)。非 CUDA 返回 inf（视为充足，不卸载）。"""
+    torch = _torch()
     if torch.cuda.is_available():
         free, _ = torch.cuda.mem_get_info()
         return free / 1024**3
@@ -46,6 +53,7 @@ def free_vram_gb() -> float:
 def clear_gpu_cache():
     """释放 GPU 缓存"""
     gc.collect()
+    torch = _torch()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
@@ -56,6 +64,7 @@ def clear_gpu_cache():
 
 def log_vram(tag: str = ""):
     """打印当前显存占用"""
+    torch = _torch()
     if torch.cuda.is_available():
         allocated = torch.cuda.memory_allocated() / 1024**3
         reserved = torch.cuda.memory_reserved() / 1024**3
@@ -93,7 +102,8 @@ class ModelManager:
     """统一的模型生命周期管理"""
 
     def __init__(self):
-        self.device = get_device()
+        self._device = None
+        self._rmbg2_lock = threading.Lock()
         self._rmbg2_engine = None
         self._vitmatte_engine = None
         self._vitmatte_variant = None
@@ -102,15 +112,29 @@ class ModelManager:
         self._sam_engine_type = None
 
     @property
+    def device(self):
+        if self._device is None:
+            self._device = get_device()
+        return self._device
+
+    @property
     def rmbg2(self):
-        """懒加载 RMBG-2.0 引擎"""
+        """Lazy-load the RMBG-2.0 engine."""
         if self._rmbg2_engine is None:
-            from engines.rmbg2 import RMBG2Engine
-            self._rmbg2_engine = RMBG2Engine(
-                model_path=os.path.join(get_models_path(), "rmbg-2.0"),
-                device=self.device
-            )
+            with self._rmbg2_lock:
+                if self._rmbg2_engine is None:
+                    from engines.rmbg2 import RMBG2Engine
+                    self._rmbg2_engine = RMBG2Engine(
+                        model_path=os.path.join(get_models_path(), "rmbg-2.0"),
+                        device=self.device,
+                    )
         return self._rmbg2_engine
+
+    def preload_rmbg2(self):
+        """Load the default RMBG model ahead of the first request."""
+        engine = self.rmbg2
+        engine._load_model()
+        return engine
 
     @property
     def vitmatte(self):

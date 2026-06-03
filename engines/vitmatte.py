@@ -22,8 +22,9 @@ class ViTMatteRefiner:
         self.model = None
         self.processor = None
         self.is_matany = is_matany
-        self._trimap_erode = 3
-        self._trimap_dilate = 8
+        self._trimap_erode = 1
+        self._trimap_dilate = 3
+        self._trimap_kernel = 7
 
     def _load_model(self):
         if self.model is not None:
@@ -195,11 +196,7 @@ class ViTMatteRefiner:
                 else:
                     strided_count += 1
 
-        parts = []
-        if window_count: parts.append(f"{window_count} window")
-        if strided_count and do_strided: parts.append(f"{strided_count} strided")
-        if not parts: parts.append("full attention")
-        print(f"[ViTMatte] mode={'+'.join(parts)}")
+        print("[ViTMatte] attention=native(window+global)")
 
     def _set_strided(self, enabled: bool):
         """切换优化 attention / 全 attention"""
@@ -261,12 +258,15 @@ class ViTMatteRefiner:
             精细化后的 HxW uint8 alpha [0,255]
         """
         self._load_model()
-        self._set_strided(enabled=True)  # Small/MatAny: 启用优化；Base: 无 patch，自动跳过
+        # 始终跑模型原生注意力（window+global），不用降质的 strided 省显存近似。
+        self._set_strided(enabled=False)
 
-        # erosion 保主体（手臂/手指不会被吃掉），dilation 给 ViTMatte 上下文
-        # Small / Base 共用同一套参数（靠 soft-alpha transition 补充细结构）
-        self._trimap_erode = 3   # ~30px，手臂/手指不会丢
-        self._trimap_dilate = 8  # ~80px，给 ViTMatte 足够边缘上下文
+        # RMBG already provides a soft alpha. Keep the unknown band narrow so
+        # ViTMatte refines the edge instead of hallucinating a broad matte.
+        if soft:
+            self._trimap_erode, self._trimap_dilate, self._trimap_kernel = 1, 3, 7
+        else:
+            self._trimap_erode, self._trimap_dilate, self._trimap_kernel = 2, 4, 7
 
         if isinstance(image, np.ndarray):
             image = Image.fromarray(image)
@@ -274,13 +274,20 @@ class ViTMatteRefiner:
         full_h, full_w = img_np.shape[:2]
 
         trimap = self._make_trimap(alpha, soft=soft,
-                                    erode=self._trimap_erode, dilate=self._trimap_dilate)
+                                    erode=self._trimap_erode,
+                                    dilate=self._trimap_dilate,
+                                    kernel_size=self._trimap_kernel)
         boxes = transparent_boxes
         if boxes is None and transparent_detector is not None:
             boxes = transparent_detector.detect(image)
         if boxes:
             print(f"[ViTMatte] 检测到 {len(boxes)} 个透明物体，修正 trimap")
             trimap = self._mark_transparent(trimap, boxes)
+
+        if _debug_dir:
+            os.makedirs(_debug_dir, exist_ok=True)
+            self._dump_trimap(trimap)
+            Image.fromarray(trimap, "L").save(os.path.join(_debug_dir, "20_vitmatte_trimap.png"))
 
         roi_ys, roi_xs = np.where(trimap > 0)
         if roi_ys.size == 0:
@@ -292,16 +299,18 @@ class ViTMatteRefiner:
 
         if mode == "full":
             result = self._refine_crop(img_np, trimap, alpha, full_h, full_w,
-                                       roi_ys, roi_xs, margin_div=50, tag_prefix="边缘crop")
+                                       roi_ys, roi_xs, margin_div=50, tag_prefix="边缘crop",
+                                       conservative=soft)
         elif mode == "subject":
             fg_ys, fg_xs = np.where(alpha > 127)
             if fg_ys.size == 0:
                 return np.zeros((full_h, full_w), dtype=np.uint8)
             result = self._refine_crop(img_np, trimap, alpha, full_h, full_w,
-                                       fg_ys, fg_xs, margin_div=25, tag_prefix="主体crop")
+                                       fg_ys, fg_xs, margin_div=25, tag_prefix="主体crop",
+                                       conservative=soft)
         else:
             result = self._refine_strip(img_np, trimap, alpha, full_h, full_w,
-                                        unk_ys, unk_xs)
+                                        unk_ys, unk_xs, conservative=soft)
 
         if _debug_dir:
             h, w = result.shape
@@ -311,12 +320,46 @@ class ViTMatteRefiner:
             edge = np.sum((result >= 10) & (result <= 245)) / total * 100
             edge_std = result[(result >= 10) & (result <= 245)].std() if np.any((result >= 10) & (result <= 245)) else 0
             print(f"[诊断] ViTMatte输出: bg={bg:.1f}% fg={fg:.1f}% edge={edge:.1f}% edge_std={edge_std:.1f}")
-            Image.fromarray(result, "L").save(os.path.join(_debug_dir, "4_vitmatte_raw.png"))
+            Image.fromarray(result, "L").save(os.path.join(_debug_dir, "21_vitmatte_alpha.png"))
 
         return result
 
+    @staticmethod
+    def _merge_refined_unknown(alpha_crop: np.ndarray, trimap_crop: np.ndarray,
+                               refined: np.ndarray, weight: np.ndarray = None,
+                               conservative: bool = False) -> np.ndarray:
+        """
+        Only replace trimap unknown pixels with ViTMatte output.
+        Known foreground/background must stay constrained, otherwise full-frame
+        predictions can leak faint alpha into sure-background areas.
+        """
+        merged = alpha_crop.astype(np.float32).copy()
+        refined_u8 = np.clip(refined * 255.0, 0, 255).astype(np.float32)
+        unknown = trimap_crop == 127
+        if not np.any(unknown):
+            return alpha_crop.copy()
+
+        orig = alpha_crop.astype(np.float32)
+        if weight is None:
+            merge_weight = np.ones_like(orig, dtype=np.float32)
+        else:
+            merge_weight = weight.astype(np.float32)
+
+        if conservative:
+            not_solid = np.clip((252.0 - orig) / 52.0, 0.0, 1.0)
+            merge_weight *= not_solid
+
+        blended = orig * (1.0 - merge_weight) + refined_u8 * merge_weight
+        merged[unknown] = blended[unknown]
+
+        merged[trimap_crop == 0] = 0.0
+        fg = trimap_crop == 255
+        merged[fg] = np.maximum(merged[fg], alpha_crop[fg].astype(np.float32))
+        return np.clip(merged, 0, 255).astype(np.uint8)
+
     def _refine_crop(self, img_np, trimap, alpha, full_h, full_w,
-                     roi_ys, roi_xs, margin_div=50, tag_prefix="crop"):
+                     roi_ys, roi_xs, margin_div=50, tag_prefix="crop",
+                     conservative: bool = False):
         """矩形 crop 推理：crop 到指定区域 + 边距，然后全图推理"""
         margin = max(32, min(full_h, full_w) // margin_div)
         x1 = max(0, int(roi_xs.min()) - margin)
@@ -330,13 +373,17 @@ class ViTMatteRefiner:
         refined = self._run_vitmatte(crop_img, crop_tri, crop_h, crop_w,
                                      f"{tag_prefix} {crop_w}x{crop_h}", full_w, full_h)
 
-        # 用原始 alpha 填充裁剪区域外的部分，避免丢失非裁剪区的 alpha 信息
         full_alpha = alpha.copy()
-        full_alpha[y1:y2, x1:x2] = (refined * 255).astype(np.uint8)
+        full_alpha[y1:y2, x1:x2] = self._merge_refined_unknown(
+            alpha[y1:y2, x1:x2],
+            crop_tri,
+            refined,
+            conservative=conservative,
+        )
         return full_alpha
 
     def _refine_strip(self, img_np, trimap, alpha, full_h, full_w,
-                      unk_ys, unk_xs):
+                      unk_ys, unk_xs, conservative: bool = False):
         """条带推理：只处理 unknown 区域 + 上下文，省显存。边界渐变混合消除接缝。"""
         STRIP_HALF = 384
         sx1 = max(0, int(unk_xs.min()) - STRIP_HALF)
@@ -363,17 +410,20 @@ class ViTMatteRefiner:
         if sx2 < full_w:
             weight[:, -BLEND:] *= np.linspace(1, 0, BLEND)[np.newaxis, :]
 
-        refined_u8 = (refined * 255).astype(np.uint8)
-        strip_orig = alpha[sy1:sy2, sx1:sx2].astype(np.float32)
-        blended = (strip_orig * (1 - weight) + refined_u8.astype(np.float32) * weight)
-
         full_alpha = alpha.copy()
-        full_alpha[sy1:sy2, sx1:sx2] = blended.astype(np.uint8)
+        full_alpha[sy1:sy2, sx1:sx2] = self._merge_refined_unknown(
+            alpha[sy1:sy2, sx1:sx2],
+            strip_tri,
+            refined,
+            weight=weight,
+            conservative=conservative,
+        )
         return full_alpha
 
     def _run_vitmatte(self, infer_img, infer_tri, infer_h, infer_w,
                       tag, full_w, full_h):
         """执行 ViTMatte 推理并返回 refined alpha"""
+        print(f"[ViTMatte] attention=native(window+global) tile={infer_w}x{infer_h}")
         t0 = time.perf_counter()
         inputs = self.processor(
             images=Image.fromarray(infer_img),
@@ -401,15 +451,15 @@ class ViTMatteRefiner:
 
     @staticmethod
     def _make_trimap(alpha: np.ndarray, soft: bool = False,
-                     erode: int = 3, dilate: int = 8) -> np.ndarray:
+                     erode: int = 1, dilate: int = 2,
+                     kernel_size: int = 5) -> np.ndarray:
         """
-        造 trimap：小 erosion 保主体（手臂/手指），大 dilation 给 ViTMatte 上下文。
-        erode=3 → ~30px erosion（不会吃掉手臂）
-        dilate=8 → ~80px dilation（给 ViTMatte 足够边缘上下文）
+        造 trimap：RMBG soft alpha 用窄 unknown band，避免 ViTMatte 生成宽鬼影。
         soft=True 时 RMBG 过渡区 (0.05<a<0.95) 补充细结构。
         """
         bin_mask = (alpha > 127).astype(np.uint8) * 255
-        kernel = np.ones((10, 10), np.uint8)
+        kernel_size = max(3, int(kernel_size))
+        kernel = np.ones((kernel_size, kernel_size), np.uint8)
         eroded = cv2.erode(bin_mask, kernel, iterations=erode)
         dilated = cv2.dilate(bin_mask, kernel, iterations=dilate)
 
@@ -438,6 +488,20 @@ class ViTMatteRefiner:
             region = result[y1:y2, x1:x2]
             region[region == 255] = 127
         return result
+
+    @staticmethod
+    def _dump_trimap(trimap: np.ndarray):
+        total = trimap.size
+        bg = np.sum(trimap == 0) / total * 100
+        unk = np.sum(trimap == 127) / total * 100
+        fg = np.sum(trimap == 255) / total * 100
+        n, _, stats, _ = cv2.connectedComponentsWithStats((trimap == 127).astype(np.uint8))
+        min_area = stats[1:, cv2.CC_STAT_AREA].min() if n > 1 else 0
+        max_area = stats[1:, cv2.CC_STAT_AREA].max() if n > 1 else 0
+        print(
+            f"[诊断] ViTMatte实际Trimap: bg={bg:.1f}% unknown={unk:.1f}% fg={fg:.1f}% | "
+            f"unknown连通域={n - 1}个 | unknown面积: min={min_area} max={max_area}"
+        )
 
     def cleanup(self):
         if self.model is not None:
