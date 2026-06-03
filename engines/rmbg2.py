@@ -19,6 +19,7 @@ class RMBG2Engine:
         self.model = None
         self.model_path = model_path
         self._load_lock = threading.Lock()
+        self._infer_lock = threading.Lock()
 
     def _load_model(self):
         if self.model is not None:
@@ -44,21 +45,21 @@ class RMBG2Engine:
         """推理 → 连通域清理 → ViTMatte 精修 → RGBA 输出
         debug_dir: 传入目录路径时，保存每一步中间结果用于诊断
         """
-        self._load_model()
-
         img_input = self._preprocess(image)
 
         t0 = time.perf_counter()
-        with torch.inference_mode():
-            if self.device == "cuda":
-                with torch.autocast(device_type="cuda", dtype=torch.float16):
+        with self._infer_lock:
+            self._load_model()
+            with torch.inference_mode():
+                if self.device == "cuda":
+                    with torch.autocast(device_type="cuda", dtype=torch.float16):
+                        result = self.model(img_input)
+                else:
                     result = self.model(img_input)
-            else:
-                result = self.model(img_input)
-        print(f"[RMBG-2.0] 推理耗时 {time.perf_counter() - t0:.2f}s")
+            mask_raw = self._postprocess(result, image.size)
+        print(f"[RMBG-2.0] inference time {time.perf_counter() - t0:.2f}s")
 
         img_array = np.array(image.convert("RGB"))
-        mask_raw = self._postprocess(result, image.size)
         mask_clean = self._clean_mask(mask_raw)
         mask = self._smooth_edge(mask_clean, img_array)
 
@@ -91,19 +92,19 @@ class RMBG2Engine:
     def predict_alpha(self, image: Image.Image, clean: bool = True,
                       smooth: bool = True) -> np.ndarray:
         """返回 RMBG soft alpha，供交互式 ROI 抠图流程做约束融合。"""
-        self._load_model()
-
         img_input = self._preprocess(image)
         t0 = time.perf_counter()
-        with torch.inference_mode():
-            if self.device == "cuda":
-                with torch.autocast(device_type="cuda", dtype=torch.float16):
+        with self._infer_lock:
+            self._load_model()
+            with torch.inference_mode():
+                if self.device == "cuda":
+                    with torch.autocast(device_type="cuda", dtype=torch.float16):
+                        result = self.model(img_input)
+                else:
                     result = self.model(img_input)
-            else:
-                result = self.model(img_input)
-        print(f"[RMBG-2.0] ROI 推理耗时 {time.perf_counter() - t0:.2f}s")
+            alpha = self._postprocess(result, image.size)
+        print(f"[RMBG-2.0] ROI inference time {time.perf_counter() - t0:.2f}s")
 
-        alpha = self._postprocess(result, image.size)
         if clean:
             alpha = self._clean_mask(alpha)
         if smooth:
@@ -208,6 +209,7 @@ class RMBG2Engine:
         return np.clip(result, 0, 255).astype(np.uint8)
 
     def cleanup(self):
-        if self.model is not None:
-            del self.model
-            self.model = None
+        with self._infer_lock, self._load_lock:
+            if self.model is not None:
+                del self.model
+                self.model = None

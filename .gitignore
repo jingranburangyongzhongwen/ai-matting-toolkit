@@ -4,3 +4,7 @@ models/
 .history
 output/
 .vscode/
+dist/
+build/
+.pyi-build/
+*.spec

@@ -1,9 +1,25 @@
 # ── 导入和全局初始化 ─────────────────────────────────────────────
-import gc, hashlib, os, warnings, signal, time, threading
+import argparse, gc, hashlib, os, warnings, signal, time, threading
+from collections import OrderedDict
+_STARTUP_T0 = time.perf_counter()
+_STARTUP_LAST = _STARTUP_T0
+_DEFAULT_WARMUP_THREAD = None
+
+
+def _startup_log(stage: str):
+    global _STARTUP_LAST
+    if os.environ.get("MATTING_STARTUP_LOG", "1") == "0":
+        return
+    now = time.perf_counter()
+    print(
+        f"[startup] {stage}: +{now - _STARTUP_LAST:.2f}s "
+        f"(total {now - _STARTUP_T0:.2f}s)"
+    )
+    _STARTUP_LAST = now
+
+
 import cv2
-import gradio as gr
-import numpy as np
-from PIL import Image
+_startup_log("import cv2")
 
 warnings.filterwarnings("ignore", message=".*TRANSFORMERS_CACHE.*")
 warnings.filterwarnings("ignore", message=".*timm.models.*")
@@ -13,24 +29,22 @@ from model_manager import (
     ModelManager, free_vram_gb, get_base_path, get_output_path,
     VITMATTE_VARIANTS, VITMATTE_PROCESS_MODES,
 )
+_startup_log("import model_manager")
 from engines.rgba_postprocess import make_clean_rgba
+_startup_log("import rgba_postprocess")
 
 os.environ["HF_HOME"] = os.path.join(get_base_path(), "models", "cache")
 mgr = ModelManager()
-KEEP_RESIDENT_FREE_GB = 6.0
-_SAM_IMAGE_FINGERPRINT = None
-ENGINE_MODE_MAP = {
-    "快速模式（MobileSAM）": "mobile_sam",
-    "高精度模式（SAM-HQ）": "sam_hq",
-}
-
-VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}
+_startup_log("initialize globals")
 
 
 def start_default_model_warmup():
     """Warm up the default RMBG path without blocking the UI server."""
+    global _DEFAULT_WARMUP_THREAD
     if os.environ.get("MATTING_PRELOAD_RMBG", "1") == "0":
         return None
+    if _DEFAULT_WARMUP_THREAD is not None:
+        return _DEFAULT_WARMUP_THREAD
 
     def _worker():
         t0 = time.perf_counter()
@@ -40,17 +54,229 @@ def start_default_model_warmup():
         except Exception as exc:
             print(f"[startup warmup] RMBG-2.0 failed: {exc}")
 
-    thread = threading.Thread(target=_worker, name="rmbg2-warmup", daemon=True)
-    thread.start()
-    return thread
+    _DEFAULT_WARMUP_THREAD = threading.Thread(
+        target=_worker, name="rmbg2-warmup", daemon=True
+    )
+    _DEFAULT_WARMUP_THREAD.start()
+    return _DEFAULT_WARMUP_THREAD
+
+
+import gradio as gr
+_startup_log("import gradio")
+import numpy as np
+_startup_log("import numpy")
+from PIL import Image
+_startup_log("import PIL")
+KEEP_RESIDENT_FREE_GB = 6.0
+_SAM_SESSION_LOCK = threading.RLock()
+_SAM_CONTEXTS = OrderedDict()
+_STALE_SAM_ACTIVE = {}
+_MULTI_SESSION_MODE = False
+_MAX_SAM_CONTEXTS = 1
+ENGINE_MODE_MAP = {
+    "快速模式（MobileSAM）": "mobile_sam",
+    "高精度模式（SAM-HQ）": "sam_hq",
+}
+TAB2_OUTPUT_MODES = {
+    "SAM严格": "sam_strict",
+    "RMBG精修": "rmbg_refine",
+}
+
+VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}
+_AGGRESSIVE_UNLOAD_ENV = os.environ.get("MATTING_AGGRESSIVE_UNLOAD")
+_AGGRESSIVE_UNLOAD = (
+    _AGGRESSIVE_UNLOAD_ENV == "1"
+    if _AGGRESSIVE_UNLOAD_ENV is not None else True
+)
+
+
+def _configure_runtime(multi_session: bool, max_sam_sessions: int):
+    """启动期配置：默认单 session 低显存友好，多 session 保持模型常驻。"""
+    global _MULTI_SESSION_MODE, _AGGRESSIVE_UNLOAD
+    _MULTI_SESSION_MODE = bool(multi_session)
+    if _AGGRESSIVE_UNLOAD_ENV is None:
+        _AGGRESSIVE_UNLOAD = not _MULTI_SESSION_MODE
+    else:
+        _AGGRESSIVE_UNLOAD = _AGGRESSIVE_UNLOAD_ENV == "1"
+    mgr.set_multi_session_mode(_MULTI_SESSION_MODE)
+    _set_max_sam_contexts(max_sam_sessions if _MULTI_SESSION_MODE else 1)
+    mode = "multi-session" if _MULTI_SESSION_MODE else "single-session"
+    print(
+        f"[runtime] mode={mode}, max_sam_sessions={_MAX_SAM_CONTEXTS}, "
+        f"aggressive_unload={_AGGRESSIVE_UNLOAD}"
+    )
+
+
+def _set_max_sam_contexts(value: int):
+    """限制常驻的 per-session SAM predictor 数量，超出后按 LRU 回收。"""
+    global _MAX_SAM_CONTEXTS
+    _MAX_SAM_CONTEXTS = max(1, int(value))
+    with _SAM_SESSION_LOCK:
+        _evict_sam_contexts_unlocked()
+
+
+def _request_session_id(request=None):
+    """Gradio 每个页面连接都有独立 session_hash；无 request 时退回单机默认。"""
+    if not _MULTI_SESSION_MODE:
+        return "default"
+    session_hash = getattr(request, "session_hash", None)
+    return str(session_hash) if session_hash else "default"
+
+
+def _cleanup_sam_context_unlocked(ctx):
+    if isinstance(ctx, dict) and ctx.get("cleaned"):
+        return
+    sam = ctx.get("sam") if isinstance(ctx, dict) else None
+    if sam is not None and hasattr(sam, "cleanup"):
+        try:
+            sam.cleanup()
+        except Exception as exc:
+            print(f"[session] SAM context cleanup failed: {exc}")
+    if isinstance(ctx, dict):
+        ctx["cleaned"] = True
+
+
+def _evict_sam_contexts_unlocked(keep_key=None):
+    scans_left = len(_SAM_CONTEXTS)
+    while len(_SAM_CONTEXTS) > _MAX_SAM_CONTEXTS and scans_left > 0:
+        old_key, old_ctx = _SAM_CONTEXTS.popitem(last=False)
+        scans_left -= 1
+        if old_key == keep_key or old_ctx.get("active", 0):
+            _SAM_CONTEXTS[old_key] = old_ctx
+            continue
+        lock = old_ctx.get("lock")
+        acquired = lock.acquire(blocking=False) if lock is not None else True
+        if not acquired:
+            # 正在推理的 session 不强制清理，避免中途 reset predictor。
+            _SAM_CONTEXTS[old_key] = old_ctx
+            continue
+        try:
+            _cleanup_sam_context_unlocked(old_ctx)
+        finally:
+            if lock is not None:
+                lock.release()
+        print(f"[session] evicted SAM context: session={old_key[0]} engine={old_key[1]}")
+
+
+def _get_sam_context(request, engine_type, retain=False):
+    """返回当前 Gradio session + 引擎类型对应的独立 SAM predictor 状态。"""
+    session_id = _request_session_id(request)
+    key = (session_id, engine_type)
+    with _SAM_SESSION_LOCK:
+        ctx = _SAM_CONTEXTS.get(key)
+        if ctx is None:
+            engine = mgr.get_sam_engine(engine_type)
+            ctx = {
+                "session_id": session_id,
+                "engine_type": engine_type,
+                "sam": engine.create_session(),
+                "fingerprint": None,
+                "box_logits": {},
+                "free_logits": {},
+                "lock": threading.RLock(),
+                "active": 0,
+                "stale": False,
+                "cleaned": False,
+            }
+            _SAM_CONTEXTS[key] = ctx
+            _evict_sam_contexts_unlocked(keep_key=key)
+        else:
+            _SAM_CONTEXTS.move_to_end(key)
+        if retain:
+            ctx["active"] += 1
+        return ctx
+
+
+def _release_sam_context(ctx):
+    should_cleanup = False
+    unload_engine_type = None
+    with _SAM_SESSION_LOCK:
+        ctx["active"] = max(0, int(ctx.get("active", 0)) - 1)
+        should_cleanup = ctx["active"] == 0 and bool(ctx.get("stale"))
+        if should_cleanup:
+            engine_type = ctx.get("engine_type")
+            _STALE_SAM_ACTIVE[engine_type] = max(
+                0, int(_STALE_SAM_ACTIVE.get(engine_type, 0)) - 1
+            )
+            if _STALE_SAM_ACTIVE[engine_type] == 0:
+                _STALE_SAM_ACTIVE.pop(engine_type, None)
+            live_same_type = any(key[1] == engine_type for key in _SAM_CONTEXTS)
+            if not _MULTI_SESSION_MODE and not live_same_type:
+                unload_engine_type = engine_type
+    if should_cleanup:
+        with ctx["lock"]:
+            _cleanup_sam_context_unlocked(ctx)
+    if unload_engine_type:
+        mgr.unload_sam_engine(unload_engine_type)
+
+
+def _clear_session_sam_contexts(request=None):
+    """清掉当前页面 session 的 SAM predictor/embedding，不影响其它用户。"""
+    session_id = _request_session_id(request)
+    had_active = False
+    removed_types = set()
+    with _SAM_SESSION_LOCK:
+        stale_keys = [key for key in _SAM_CONTEXTS if key[0] == session_id]
+        for key in stale_keys:
+            ctx = _SAM_CONTEXTS.pop(key)
+            removed_types.add(key[1])
+            if ctx.get("active", 0):
+                if not ctx.get("stale"):
+                    ctx["stale"] = True
+                    _STALE_SAM_ACTIVE[key[1]] = _STALE_SAM_ACTIVE.get(key[1], 0) + 1
+                had_active = True
+                continue
+            with ctx["lock"]:
+                _cleanup_sam_context_unlocked(ctx)
+    if not _MULTI_SESSION_MODE and not had_active:
+        live_types = {key[1] for key in _SAM_CONTEXTS}
+        for engine_type in removed_types - live_types:
+            mgr.unload_sam_engine(engine_type)
+
+
+def _clear_all_sam_contexts():
+    had_active = False
+    with _SAM_SESSION_LOCK:
+        while _SAM_CONTEXTS:
+            _, ctx = _SAM_CONTEXTS.popitem(last=False)
+            if ctx.get("active", 0):
+                if not ctx.get("stale"):
+                    ctx["stale"] = True
+                    engine_type = ctx.get("engine_type")
+                    _STALE_SAM_ACTIVE[engine_type] = _STALE_SAM_ACTIVE.get(engine_type, 0) + 1
+                had_active = True
+                continue
+            with ctx["lock"]:
+                _cleanup_sam_context_unlocked(ctx)
+    if not had_active:
+        mgr.unload_sam()
+
+
+def _reset_sam_interaction_state_unlocked(ctx):
+    """清理单个 session 的 SAM 交互先验，保留已缓存的图像 embedding。"""
+    ctx["box_logits"] = {}
+    ctx["free_logits"] = {}
+    sam = ctx.get("sam")
+    if sam is None:
+        return
+    sam._prev_logits = None
+    sam._prev_npoints = 0
+    sam._cached_mask = None
+
+
+def _reset_session_sam_interaction_state(request=None):
+    session_id = _request_session_id(request)
+    with _SAM_SESSION_LOCK:
+        contexts = [ctx for key, ctx in _SAM_CONTEXTS.items() if key[0] == session_id]
+    for ctx in contexts:
+        with ctx["lock"]:
+            _reset_sam_interaction_state_unlocked(ctx)
 
 
 # ── Tab 1 后端：一键抠图 ────────────────────────────────────────
 def _unload_sam_and_reset_state():
-    """卸载 SAM 并同步清空本模块维护的图像指纹。"""
-    global _SAM_IMAGE_FINGERPRINT
-    mgr.unload_sam()
-    _SAM_IMAGE_FINGERPRINT = None
+    """低显存兼容：只在显式启用 aggressive unload 时卸载所有 SAM。"""
+    _clear_all_sam_contexts()
 
 
 def on_auto_process(files, source_img, detect_transparent, vitmatte_variant,
@@ -71,10 +297,13 @@ def on_auto_process(files, source_img, detect_transparent, vitmatte_variant,
 
     needs_vitmatte = variant_key != "none"
     needs_dino = bool(detect_transparent)
-    low_vram = free_vram_gb() < KEEP_RESIDENT_FREE_GB
+    should_unload_unused = (
+        _AGGRESSIVE_UNLOAD
+        and (not _MULTI_SESSION_MODE or free_vram_gb() < KEEP_RESIDENT_FREE_GB)
+    )
 
-    # 一键抠图必走 RMBG-2.0；低显存时只释放本次不会使用的常驻模型。
-    if low_vram:
+    # 一键抠图必走 RMBG-2.0；单 session 默认释放本次不会使用的常驻模型。
+    if should_unload_unused:
         _unload_sam_and_reset_state()
         if not needs_dino:
             mgr.unload_grounding_dino()
@@ -84,8 +313,7 @@ def on_auto_process(files, source_img, detect_transparent, vitmatte_variant,
     refiner = None
     if needs_vitmatte:
         try:
-            mgr.switch_vitmatte(variant_key)
-            refiner = mgr.vitmatte
+            refiner = mgr.get_vitmatte(variant_key)
         except FileNotFoundError as e:
             yield gr.update(), f"模型加载失败: {e}", gr.update(), gr.update(visible=False)
             return
@@ -219,48 +447,354 @@ def _image_fingerprint(image):
     return arr.shape, arr.dtype.str, digest
 
 
-def _reset_sam_interaction_state():
-    """清理 SAM 的交互先验，避免旧 mask/logits 污染下一次标记。"""
-    if mgr._sam_engine is None:
-        return
-    mgr.sam._prev_logits = None
-    mgr.sam._prev_npoints = 0
-    mgr.sam._cached_mask = None
+def _filter_tab2_box_logits(ctx, boxes, *, keep_active: bool):
+    """按当前候选框过滤 box logits；keep_active=False 用于丢弃初次文本预览先验。"""
+    active_keys = {_box_cache_key(box) for box in _normalize_box_state(boxes)}
+    fingerprint = ctx.get("fingerprint")
+    ctx["box_logits"] = {
+        key: value for key, value in ctx["box_logits"].items()
+        if (
+            isinstance(key, tuple) and len(key) >= 4
+            and key[0] == fingerprint
+            and key[2] in active_keys
+        ) == keep_active
+    }
+
+
+def _normalize_box_state(box_state):
+    """把单框/多框 state 统一成 [[x1, y1, x2, y2], ...]。"""
+    if box_state is None:
+        return []
+    arr = np.asarray(box_state, dtype=object)
+    if arr.ndim == 1 and len(arr) == 4:
+        return [[float(v) for v in arr.tolist()]]
+
+    boxes = []
+    for item in box_state:
+        vals = np.asarray(item, dtype=float).reshape(-1)
+        if vals.size != 4:
+            continue
+        x1, y1, x2, y2 = vals.tolist()
+        if x2 > x1 and y2 > y1:
+            boxes.append([float(x1), float(y1), float(x2), float(y2)])
+    return boxes
+
+
+def _box_state_has_boxes(box_state):
+    return len(_normalize_box_state(box_state)) > 0
+
+
+def _box_area(box):
+    x1, y1, x2, y2 = box
+    return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
+
+def _box_intersection(a, b):
+    x1 = max(a[0], b[0])
+    y1 = max(a[1], b[1])
+    x2 = min(a[2], b[2])
+    y2 = min(a[3], b[3])
+    return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
+
+def _box_iou(a, b):
+    inter = _box_intersection(a, b)
+    union = _box_area(a) + _box_area(b) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _box_containment(container, inner):
+    inner_area = _box_area(inner)
+    if inner_area <= 0:
+        return 0.0
+    return _box_intersection(container, inner) / inner_area
+
+
+def _filter_text_candidate_boxes(boxes, scores, image_shape, max_prompts=8):
+    """去掉重复框和明显的大包小 wrapper，保留可交互的多个候选。"""
+    h, w = image_shape[:2]
+    has_scores = scores is not None and len(scores) == len(boxes)
+    if not has_scores:
+        scores = [0.0] * len(boxes)
+    candidates = []
+    for idx, (box, score) in enumerate(zip(boxes, scores)):
+        x1, y1, x2, y2 = [float(v) for v in box]
+        clipped = [max(0.0, x1), max(0.0, y1), min(float(w), x2), min(float(h), y2)]
+        if _box_area(clipped) >= 64:
+            candidates.append({"box": clipped, "score": float(score), "idx": idx})
+
+    if has_scores:
+        candidates.sort(key=lambda item: item["score"], reverse=True)
+    stats = {
+        "raw": len(candidates),
+        "wrapper": 0,
+        "duplicate": 0,
+        "capped": 0,
+        "has_scores": has_scores,
+    }
+    if not candidates:
+        return [], [], stats
+
+    no_wrappers = []
+    for i, item in enumerate(candidates):
+        box = item["box"]
+        area = _box_area(box)
+        children = [
+            other for j, other in enumerate(candidates)
+            if i != j
+            and area > _box_area(other["box"]) * 1.8
+            and _box_containment(box, other["box"]) >= 0.94
+        ]
+        if children:
+            best_child_score = max(child["score"] for child in children) if has_scores else 0.0
+            if len(children) >= 2 or not has_scores or item["score"] <= best_child_score + 0.12:
+                stats["wrapper"] += 1
+                continue
+        no_wrappers.append(item)
+
+    filtered = no_wrappers or candidates
+    selected = []
+    for item in filtered:
+        if any(_box_iou(item["box"], kept["box"]) >= 0.78 for kept in selected):
+            stats["duplicate"] += 1
+            continue
+        selected.append(item)
+        if len(selected) >= max_prompts:
+            break
+    stats["capped"] = max(0, len(filtered) - stats["duplicate"] - len(selected))
+
+    return [item["box"] for item in selected], [item["score"] for item in selected], stats
+
+
+def _union_boxes(boxes, image_shape):
+    """返回多框外接框，供空 mask fallback 使用。"""
+    boxes = _normalize_box_state(boxes)
+    if not boxes:
+        return None
+    h, w = image_shape[:2]
+    xs1, ys1, xs2, ys2 = zip(*boxes)
+    return [
+        max(0, int(min(xs1))),
+        max(0, int(min(ys1))),
+        min(w, int(max(xs2))),
+        min(h, int(max(ys2))),
+    ]
+
+
+def _point_in_any_box(point, boxes):
+    x, y = point
+    return any(x1 <= x <= x2 and y1 <= y <= y2 for x1, y1, x2, y2 in boxes)
+
+
+def _point_in_box(point, box):
+    x, y = point
+    x1, y1, x2, y2 = box
+    return x1 <= x <= x2 and y1 <= y <= y2
+
+
+def _box_cache_key(box):
+    return tuple(float(v) for v in box)
+
+
+def _points_for_box(points, labels, box):
+    """正向点只作用于所在框；负向点全局保留用于排除误选。"""
+    local_points = []
+    local_labels = []
+    for pt, label in zip(points, labels):
+        if label == 0 or _point_in_box(pt, box):
+            local_points.append(pt)
+            local_labels.append(label)
+    return local_points, local_labels
+
+
+def _set_sam_logits_for_prediction(sam, logits):
+    sam._prev_logits = logits
+    sam._prev_npoints = 0 if logits is None else 1
+
+
+def _prompt_signature(points, labels):
+    return tuple(
+        (float(pt[0]), float(pt[1]), int(label))
+        for pt, label in zip(points, labels)
+    )
+
+
+def _prefix_prompt_signature(points, labels):
+    if not points:
+        return None
+    return _prompt_signature(points[:-1], labels[:-1])
+
+
+def _cache_get_with_prefix(cache, current_key, prefix_key):
+    if current_key in cache:
+        return cache[current_key]
+    if prefix_key is not None:
+        return cache.get(prefix_key)
+    return None
+
+
+def _prune_tab2_free_logits(ctx):
+    fingerprint = ctx.get("fingerprint")
+    ctx["free_logits"] = {
+        key: value for key, value in ctx["free_logits"].items()
+        if isinstance(key, tuple) and len(key) >= 3 and key[0] == fingerprint
+    }
+
+
+def _predict_tab2_mask(ctx, points, labels, box_state):
+    """
+    支持 Grounding-DINO 多候选框：每个 box 独立跑 SAM 后合并，避免框之间互相污染。
+    """
+    with ctx["lock"]:
+        sam = ctx["sam"]
+        fingerprint = ctx.get("fingerprint")
+        points = list(points or [])
+        labels = list(labels or [])
+        boxes = _normalize_box_state(box_state)
+        if not boxes:
+            ctx["box_logits"] = {}
+            _prune_tab2_free_logits(ctx)
+            sig = _prompt_signature(points, labels)
+            prefix_sig = _prefix_prompt_signature(points, labels)
+            current_key = (fingerprint, "free", sig)
+            prefix_key = (
+                (fingerprint, "free", prefix_sig)
+                if prefix_sig is not None else None
+            )
+            _set_sam_logits_for_prediction(
+                sam,
+                _cache_get_with_prefix(ctx["free_logits"], current_key, prefix_key)
+            )
+            mask = sam.predict_mask(points, labels, box=None)
+            ctx["free_logits"][current_key] = sam._prev_logits
+            return mask
+
+        _filter_tab2_box_logits(ctx, boxes, keep_active=True)
+        _prune_tab2_free_logits(ctx)
+        combined = np.zeros(sam._original_size, dtype=bool)
+        single_box_logits = None
+        for box in boxes:
+            box_key = _box_cache_key(box)
+            box_points, box_labels = _points_for_box(points, labels, box)
+            sig = _prompt_signature(box_points, box_labels)
+            prefix_sig = _prefix_prompt_signature(box_points, box_labels)
+            current_key = (fingerprint, "box", box_key, sig)
+            prefix_key = (
+                (fingerprint, "box", box_key, prefix_sig)
+                if prefix_sig is not None else None
+            )
+            _set_sam_logits_for_prediction(
+                sam,
+                _cache_get_with_prefix(ctx["box_logits"], current_key, prefix_key)
+            )
+            combined |= sam.predict_mask(box_points, box_labels, box=box)
+            single_box_logits = sam._prev_logits
+            ctx["box_logits"][current_key] = single_box_logits
+
+        extra_points = [
+            pt for pt, label in zip(points, labels)
+            if label == 1 and not _point_in_any_box(pt, boxes)
+        ]
+        has_extra_free_mask = bool(extra_points)
+        if extra_points:
+            extra_labels = [1] * len(extra_points)
+            sig = _prompt_signature(extra_points, extra_labels)
+            prefix_sig = _prefix_prompt_signature(extra_points, extra_labels)
+            current_key = (fingerprint, "free", sig)
+            prefix_key = (
+                (fingerprint, "free", prefix_sig)
+                if prefix_sig is not None else None
+            )
+            _set_sam_logits_for_prediction(
+                sam,
+                _cache_get_with_prefix(ctx["free_logits"], current_key, prefix_key)
+            )
+            combined |= sam.predict_mask(extra_points, extra_labels, box=None)
+            ctx["free_logits"][current_key] = sam._prev_logits
+
+        sam._cached_mask = combined
+        if len(boxes) == 1 and not has_extra_free_mask:
+            # 单框仍可安全保留 SAM 自身先验；多框 union 没有单一 logits 可回喂。
+            sam._prev_logits = single_box_logits
+            sam._prev_npoints = len(_points_for_box(points, labels, boxes[0])[0])
+        else:
+            # 多框的迭代先验保存在 ctx["box_logits"] / ctx["free_logits"] 中。
+            sam._prev_logits = None
+            sam._prev_npoints = len(points)
+        return combined
+
+
+def _draw_tab2_overlay(image, mask, points, labels, box_state=None,
+                       mask_color=(255, 0, 0), opacity=0.4):
+    overlay = image.copy().astype(np.float32)
+    color_array = np.array(mask_color, dtype=np.float32)
+    for c in range(3):
+        overlay[:, :, c] = np.where(
+            mask,
+            overlay[:, :, c] * (1 - opacity) + color_array[c] * opacity,
+            overlay[:, :, c],
+        )
+    img = overlay.clip(0, 255).astype(np.uint8)
+    for box in _normalize_box_state(box_state):
+        x1, y1, x2, y2 = [int(round(v)) for v in box]
+        cv2.rectangle(img, (x1, y1), (x2, y2), (255, 200, 0), 2)
+    for coord, label in zip(points, labels):
+        x, y = int(coord[0]), int(coord[1])
+        color = (0, 255, 0) if label == 1 else (255, 0, 0)
+        cv2.circle(img, (x, y), 8, color, -1)
+        cv2.circle(img, (x, y), 8, (255, 255, 255), 2)
+    return img
 
 
 def _unload_unused_for_tab2_sam_hq(keep_grounding_dino=False):
     """SAM-HQ 低显存准备：只释放 Tab 2 后续不会马上用到的模型。"""
-    if free_vram_gb() >= KEEP_RESIDENT_FREE_GB:
+    if not _AGGRESSIVE_UNLOAD:
         return
+    if not _MULTI_SESSION_MODE or free_vram_gb() < KEEP_RESIDENT_FREE_GB:
+        # Tab 2 默认走 SAM 严格模式；只有 RMBG 精修模式才会重新加载 RMBG。
+        mgr.unload_vitmatte()
+        if not keep_grounding_dino:
+            mgr.unload_grounding_dino()
 
-    # Tab 2 最终生成必走 RMBG-2.0，不能在这里卸载后又马上重载。
-    mgr.unload_vitmatte()
-    if not keep_grounding_dino:
-        mgr.unload_grounding_dino()
 
-
-def _ensure_sam_ready(image, engine_mode, keep_grounding_dino=False):
-    """确保 SAM 引擎就绪，返回是否切换了引擎"""
-    global _SAM_IMAGE_FINGERPRINT
+def _ensure_sam_ready(
+    image,
+    engine_mode,
+    keep_grounding_dino=False,
+    request=None,
+    retain=False,
+):
+    """确保当前 session 的 SAM predictor 就绪，返回其上下文。"""
     engine_type = ENGINE_MODE_MAP.get(engine_mode, "mobile_sam")
+    if not _MULTI_SESSION_MODE:
+        with _SAM_SESSION_LOCK:
+            current_types = {
+                key[1] for key, ctx in _SAM_CONTEXTS.items()
+                if not ctx.get("stale")
+            }
+        if current_types and engine_type not in current_types:
+            _clear_session_sam_contexts(request)
     if engine_type == "sam_hq":
-        _unload_unused_for_tab2_sam_hq(
-            keep_grounding_dino=keep_grounding_dino
-        )
-    switched = mgr.switch_sam(engine_type)
+        _unload_unused_for_tab2_sam_hq(keep_grounding_dino=keep_grounding_dino)
+    ctx = _get_sam_context(request, engine_type, retain=retain)
     fingerprint = _image_fingerprint(image)
-    if switched or not mgr.sam._image_set or fingerprint != _SAM_IMAGE_FINGERPRINT:
-        mgr.sam.set_image(image)
-        _SAM_IMAGE_FINGERPRINT = fingerprint
-        return True
-    return False
+    try:
+        with ctx["lock"]:
+            sam = ctx["sam"]
+            if not sam._image_set or fingerprint != ctx.get("fingerprint"):
+                sam.set_image(image)
+                ctx["fingerprint"] = fingerprint
+                _reset_sam_interaction_state_unlocked(ctx)
+    except Exception:
+        if retain:
+            _release_sam_context(ctx)
+        raise
+    return ctx
 
 
-def on_image_upload(files):
+def on_image_upload(files, request: gr.Request = None):
     """上传后隐藏上传提示，显示画布。"""
-    global _SAM_IMAGE_FINGERPRINT
-    _SAM_IMAGE_FINGERPRINT = None
-    _reset_sam_interaction_state()
+    _clear_session_sam_contexts(request)
     if not files:
         return gr.update(value=None, visible=True), gr.update(value=None, visible=False), \
             gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), \
@@ -277,18 +811,16 @@ def on_image_upload(files):
             [], [], None, None, "图片加载失败"
 
 
-def on_canvas_clear_source():
+def on_canvas_clear_source(request: gr.Request = None):
     """清空原图区：恢复上传提示，并清空画布、结果和标记。"""
-    global _SAM_IMAGE_FINGERPRINT
-    _SAM_IMAGE_FINGERPRINT = None
-    _reset_sam_interaction_state()
+    _clear_session_sam_contexts(request)
     return gr.update(value=None, visible=True), gr.update(value=None, visible=False), \
         gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), \
         [], [], None, None, "请先上传图片"
 
 
 def on_image_click(image, evt: gr.SelectData, mode, engine_mode, text_locate_enabled,
-                   points_state, labels_state, box_state):
+                   points_state, labels_state, box_state, request: gr.Request = None):
     if image is None:
         return image, gr.update(visible=False), points_state, labels_state, box_state, "请先上传图片"
     try:
@@ -301,13 +833,19 @@ def on_image_click(image, evt: gr.SelectData, mode, engine_mode, text_locate_ena
     new_labels = list(labels_state) + [label]
 
     try:
-        _ensure_sam_ready(
+        ctx = _ensure_sam_ready(
             image,
             engine_mode,
             keep_grounding_dino=bool(text_locate_enabled),
+            retain=True,
+            request=request,
         )
-        overlay = mgr.sam.predict_and_overlay(
-            image, new_points, new_labels, box=box_state
+        try:
+            mask = _predict_tab2_mask(ctx, new_points, new_labels, box_state)
+        finally:
+            _release_sam_context(ctx)
+        overlay = _draw_tab2_overlay(
+            image, mask, new_points, new_labels, box_state
         )
         tag = "正向" if label == 1 else "负向"
         status = f"已添加{tag}标记 ({x}, {y})，共 {len(new_points)} 个点"
@@ -316,41 +854,75 @@ def on_image_click(image, evt: gr.SelectData, mode, engine_mode, text_locate_ena
         return image, gr.update(visible=False), new_points, new_labels, box_state, f"预测失败: {e}"
 
 
-def on_text_locate(image, caption, engine_mode):
+def on_text_locate(image, caption, engine_mode, request: gr.Request = None):
     if image is None:
         return None, gr.update(visible=False), [], [], None, "请先上传图片"
     if not caption or not caption.strip():
         return image, gr.update(visible=False), [], [], None, "请输入定位描述"
 
     try:
-        _ensure_sam_ready(image, engine_mode, keep_grounding_dino=True)
-        _reset_sam_interaction_state()
         caption_for_dino = caption.strip()
         if not caption_for_dino.endswith("."):
             caption_for_dino += "."
-        boxes = mgr.grounding_dino.detect(image, caption=caption_for_dino)
+        boxes, scores = mgr.grounding_dino.detect(
+            image,
+            caption=caption_for_dino,
+            box_threshold=0.18,
+            text_threshold=0.18,
+            max_boxes=16,
+            return_scores=True,
+        )
         if not boxes:
             return image, gr.update(visible=False), [], [], None, "未找到匹配物体"
 
-        # 多个框合并为外接矩形，加 margin 给 SAM 足够上下文
-        xs = []
-        ys = []
-        for b in boxes:
-            xs.extend([b[0], b[2]])
-            ys.extend([b[1], b[3]])
         h, w = image.shape[:2]
-        bw, bh = max(xs) - min(xs), max(ys) - min(ys)
-        margin = max(30, int(max(bw, bh) * 0.5))
-        box = [
-            max(0, min(xs) - margin),
-            max(0, min(ys) - margin),
-            min(w, max(xs) + margin),
-            min(h, max(ys) + margin),
-        ]
+        boxes, scores, filter_stats = _filter_text_candidate_boxes(
+            boxes, scores, image.shape, max_prompts=8
+        )
+        if not boxes:
+            return image, gr.update(visible=False), [], [], None, "候选框过滤后为空，请换个描述"
 
-        overlay = mgr.sam.predict_and_overlay(image, [], [], box=box)
-        status = f"文本定位: '{caption}' → 框 [{int(box[0])},{int(box[1])},{int(box[2])},{int(box[3])}]"
-        return overlay, gr.update(visible=True), [], [], box, status
+        prompt_boxes = []
+        for box_raw in boxes:
+            bw, bh = box_raw[2] - box_raw[0], box_raw[3] - box_raw[1]
+            margin = max(12, int(max(bw, bh) * 0.08))
+            prompt_boxes.append([
+                max(0, box_raw[0] - margin),
+                max(0, box_raw[1] - margin),
+                min(w, box_raw[2] + margin),
+                min(h, box_raw[3] + margin),
+            ])
+
+        ctx = _ensure_sam_ready(
+            image,
+            engine_mode,
+            keep_grounding_dino=True,
+            retain=True,
+            request=request,
+        )
+        try:
+            with ctx["lock"]:
+                _reset_sam_interaction_state_unlocked(ctx)
+                mask = _predict_tab2_mask(ctx, [], [], prompt_boxes)
+                _filter_tab2_box_logits(ctx, prompt_boxes, keep_active=False)
+        finally:
+            _release_sam_context(ctx)
+        overlay = _draw_tab2_overlay(image, mask, [], [], prompt_boxes)
+        score_text = (
+            ", ".join(f"{s:.2f}" for s in scores[:len(prompt_boxes)])
+            if filter_stats["has_scores"] else "N/A"
+        )
+        score_note = "" if filter_stats["has_scores"] else "（无score，按模型原顺序）"
+        filter_text = (
+            f"；已过滤 大框{filter_stats['wrapper']} / 重复{filter_stats['duplicate']}"
+            if filter_stats["wrapper"] or filter_stats["duplicate"] else ""
+        )
+        cap_text = f" / 截断{filter_stats['capped']}" if filter_stats["capped"] else ""
+        status = (
+            f"文本定位: '{caption}' → {len(prompt_boxes)} 个候选框 "
+            f"score={score_text}{score_note}{filter_text}{cap_text}；可继续加正/负点修正"
+        )
+        return overlay, gr.update(visible=True), [], [], prompt_boxes, status
     except Exception as e:
         return image, gr.update(visible=False), [], [], None, f"定位失败: {e}"
 
@@ -366,11 +938,10 @@ def _mask_bbox(mask: np.ndarray, image_shape, fallback_box=None):
     h, w = image_shape[:2]
     ys, xs = np.where(mask > 0)
     if ys.size == 0:
-        if fallback_box is None:
+        fallback = _union_boxes(fallback_box, image_shape)
+        if fallback is None:
             return None
-        x1, y1, x2, y2 = fallback_box
-        return [max(0, int(x1)), max(0, int(y1)),
-                min(w, int(x2)), min(h, int(y2))]
+        return fallback
     return [int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1]
 
 
@@ -433,7 +1004,9 @@ def _build_sam_constraints(sam_mask: np.ndarray, bbox, image_shape):
     soft = cv2.GaussianBlur(soft, (blur_k, blur_k), 0).astype(np.float32) / 255.0
     soft[sam_mask > 0] = 1.0
 
-    allow_k = _odd_kernel(base_dim * 0.08, 31, 181)
+    # Tab 2 is an interactive selection path. Keep the allow band close to SAM
+    # so ROI RMBG haze/neighbor subjects do not survive as a visible extra rim.
+    allow_k = _odd_kernel(base_dim * 0.045, 19, 101)
     allow_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (allow_k, allow_k))
     hard_allow = cv2.dilate(sam_u8, allow_kernel) > 0
 
@@ -447,6 +1020,31 @@ def _build_sam_constraints(sam_mask: np.ndarray, bbox, image_shape):
     recover_allow = cv2.dilate(sam_u8, recover_kernel) > 0
 
     return np.clip(soft, 0.0, 1.0), hard_allow, recover_allow
+
+
+def _suppress_tab2_extra_fringe(alpha: np.ndarray, sam_mask: np.ndarray, bbox) -> np.ndarray:
+    """Remove low-confidence RMBG leftovers outside the selected SAM boundary."""
+    x1, y1, x2, y2 = [int(v) for v in bbox]
+    base_dim = max(1, min(x2 - x1, y2 - y1))
+    sam_u8 = (sam_mask > 0).astype(np.uint8)
+
+    inner_k = _odd_kernel(base_dim * 0.012, 5, 25)
+    inner_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (inner_k, inner_k))
+    near_sam = cv2.dilate(sam_u8, inner_kernel) > 0
+
+    loose_k = _odd_kernel(base_dim * 0.03, 11, 71)
+    loose_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (loose_k, loose_k))
+    loose_sam = cv2.dilate(sam_u8, loose_kernel) > 0
+
+    out = alpha.copy()
+    outside_inner = ~near_sam
+    far_outside = ~loose_sam
+
+    # Low alpha around the selection is usually the "extra edge" seen in Tab 2.
+    out[outside_inner & (out < 0.42)] = 0.0
+    out[outside_inner & (out < 0.72)] *= 0.35
+    out[far_outside & (out < 0.90)] = 0.0
+    return out
 
 
 def _apply_negative_points(alpha: np.ndarray, points, labels, bbox):
@@ -477,6 +1075,33 @@ def _make_rgba_result(image: np.ndarray, alpha: np.ndarray, debug_dir: str = Non
         debug_dir=debug_dir,
         preserve_transparency=preserve_transparency,
     )
+
+
+def _sam_strict_alpha(sam_mask: np.ndarray, points_state, labels_state,
+                      box_state, image_shape):
+    """Use SAM as the final boundary; only add a tiny anti-aliased transition."""
+    subject_box = _mask_bbox(sam_mask, image_shape, fallback_box=box_state)
+    if subject_box is None:
+        raise ValueError("SAM 未得到有效主体区域")
+
+    mask_u8 = (sam_mask > 0).astype(np.uint8) * 255
+    x1, y1, x2, y2 = subject_box
+    base_dim = max(1, min(x2 - x1, y2 - y1))
+
+    # Close tiny SAM holes, then feather only a 1-3 px contour for anti-aliasing.
+    close_k = _odd_kernel(base_dim * 0.006, 3, 11)
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k, close_k))
+    mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, close_kernel)
+
+    blur_k = _odd_kernel(base_dim * 0.004, 3, 9)
+    blurred = cv2.GaussianBlur(mask_u8.astype(np.float32), (blur_k, blur_k), 0)
+
+    alpha = mask_u8.astype(np.float32) / 255.0
+    contour = cv2.morphologyEx(mask_u8, cv2.MORPH_GRADIENT, close_kernel) > 0
+    alpha[contour] = blurred[contour] / 255.0
+
+    alpha = _apply_negative_points(alpha, points_state, labels_state, subject_box)
+    return (np.clip(alpha, 0.0, 1.0) * 255).round().astype(np.uint8), subject_box
 
 
 def _sam_guided_rmbg_alpha(image: np.ndarray, sam_mask: np.ndarray,
@@ -528,37 +1153,48 @@ def _sam_guided_rmbg_alpha(image: np.ndarray, sam_mask: np.ndarray,
     high_conf = (full_alpha > 0.95) & recover_allow
     final_alpha[high_conf] = full_alpha[high_conf]
     final_alpha[~hard_allow] = 0.0
+    final_alpha = _suppress_tab2_extra_fringe(final_alpha, sam_mask, subject_box)
 
     final_alpha = _apply_negative_points(final_alpha, points_state, labels_state, subject_box)
     final_alpha = np.clip(final_alpha, 0.0, 1.0)
     return (final_alpha * 255).round().astype(np.uint8), subject_box, roi_box, quality_notes
 
 
-def on_generate_cutout(image, engine_mode, points_state,
+def on_generate_cutout(image, engine_mode, output_mode, points_state,
                        labels_state, box_state, preserve_transparency=False,
-                       save_debug=False):
+                       save_debug=False, request: gr.Request = None):
     """generator，yield (result_img, result_view_btn, status_text)"""
     if image is None:
         yield gr.update(), gr.update(), gr.update()
         return
-    if not points_state and box_state is None:
+    if not points_state and not _box_state_has_boxes(box_state):
         yield gr.update(), gr.update(), "请先标记区域或用文本定位"
         return
 
     try:
         # SAM 分割（优先用交互 overlay 缓存的 mask，保证一致）
         yield gr.update(), gr.update(), "SAM 分割中..."
-        _ensure_sam_ready(image, engine_mode)
-        if mgr.sam._cached_mask is not None:
-            mask = mgr.sam._cached_mask
-        else:
-            mask = mgr.sam.predict_mask(points_state, labels_state, box=box_state)
+        ctx = _ensure_sam_ready(image, engine_mode, request=request, retain=True)
+        try:
+            mask = _predict_tab2_mask(ctx, points_state, labels_state, box_state)
+        finally:
+            _release_sam_context(ctx)
 
-        # 商业级融合：SAM 负责主体先验，RMBG 在扩边 ROI 内重新判断精细 alpha。
-        yield gr.update(), gr.update(), "RMBG-2.0 ROI 精修中..."
-        alpha, subject_box, roi_box, quality_notes = _sam_guided_rmbg_alpha(
-            image, mask, points_state, labels_state, box_state
-        )
+        mode_key = TAB2_OUTPUT_MODES.get(output_mode, "sam_strict")
+        quality_notes = []
+        roi_box = None
+        if mode_key == "rmbg_refine":
+            # Optional soft-alpha path: SAM selects the subject, RMBG may still alter edges.
+            yield gr.update(), gr.update(), "RMBG-2.0 ROI 精修中..."
+            alpha, subject_box, roi_box, quality_notes = _sam_guided_rmbg_alpha(
+                image, mask, points_state, labels_state, box_state
+            )
+        else:
+            yield gr.update(), gr.update(), "SAM 严格选区输出中..."
+            alpha, subject_box = _sam_strict_alpha(
+                mask, points_state, labels_state, box_state, image.shape
+            )
+            quality_notes.append("SAM严格边界")
         # 保存到 output/
         output_dir = get_output_path()
         out_path = os.path.join(output_dir, "cutout.png")
@@ -580,34 +1216,35 @@ def on_generate_cutout(image, engine_mode, points_state,
         result.save(out_path)
 
         sx1, sy1, sx2, sy2 = subject_box
-        rx1, ry1, rx2, ry2 = roi_box
         notes = list(quality_notes)
         if preserve_transparency:
             notes.append("透明材质保护")
         if save_debug:
             notes.append(f"诊断目录: {os.path.basename(debug_dir)}")
         note_text = f"\n质量保护: {'、'.join(sorted(set(notes)))}" if notes else ""
+        roi_text = ""
+        if roi_box is not None:
+            rx1, ry1, rx2, ry2 = roi_box
+            roi_text = f"，RMBG扩边ROI: [{rx1},{ry1},{rx2},{ry2}]"
         yield result, gr.update(visible=True), (
             f"完成！已保存到 {os.path.basename(out_path)}\n"
-            f"SAM主体框: [{sx1},{sy1},{sx2},{sy2}]，RMBG扩边ROI: [{rx1},{ry1},{rx2},{ry2}]"
+            f"SAM主体框: [{sx1},{sy1},{sx2},{sy2}]{roi_text}"
             f"{note_text}"
         )
     except Exception as e:
         yield gr.update(), gr.update(), f"生成失败: {e}"
 
 
-def on_clear_points(image):
+def on_clear_points(image, request: gr.Request = None):
     if image is None:
         return None, gr.update(visible=False), [], [], None, "请先上传图片"
-    _reset_sam_interaction_state()
+    _reset_session_sam_interaction_state(request)
     return None, gr.update(visible=False), [], [], None, "标记和文本定位已清除"
 
 
-def on_engine_mode_change(image):
+def on_engine_mode_change(image, request: gr.Request = None):
     """切换 SAM 引擎后清空旧选区预览，避免新旧引擎结果混淆。"""
-    global _SAM_IMAGE_FINGERPRINT
-    _SAM_IMAGE_FINGERPRINT = None
-    _reset_sam_interaction_state()
+    _clear_session_sam_contexts(request)
     if image is None:
         return None, gr.update(visible=False), [], [], None, "请先上传图片"
     return None, gr.update(visible=False), [], [], None, "引擎已切换，请重新标记"
@@ -1028,7 +1665,7 @@ APP_JS = """
 
 
 # ── build_ui() 构建界面 ─────────────────────────────────────────
-def build_ui():
+def build_ui(model_concurrency_limit=2):
     with gr.Blocks(title="全自动抠图") as demo:
         gr.Markdown("# 全自动抠图工具")
 
@@ -1145,6 +1782,12 @@ def build_ui():
                         choices=list(ENGINE_MODE_MAP.keys()),
                         value="快速模式（MobileSAM）",
                         label="引擎模式",
+                        elem_classes="segment-control",
+                    )
+                    tab2_output_mode = gr.Radio(
+                        choices=list(TAB2_OUTPUT_MODES.keys()),
+                        value="SAM严格",
+                        label="输出模式",
                         elem_classes="segment-control",
                     )
 
@@ -1289,6 +1932,8 @@ def build_ui():
             outputs=[auto_input_img, auto_status, auto_result_img,
                      auto_result_view_btn],
             stream_every=0.5,
+            concurrency_limit=model_concurrency_limit,
+            concurrency_id="model-gpu",
         )
 
         # --- Tab 2 ---
@@ -1331,6 +1976,8 @@ def build_ui():
             inputs=[canvas_img, text_caption, engine_mode],
             outputs=[result_img, result_view_btn, points_state, labels_state,
                      box_state, cutout_status],
+            concurrency_limit=model_concurrency_limit,
+            concurrency_id="model-gpu",
         )
 
         canvas_img.select(
@@ -1339,6 +1986,8 @@ def build_ui():
                     points_state, labels_state, box_state],
             outputs=[result_img, result_view_btn, points_state, labels_state,
                      box_state, cutout_status],
+            concurrency_limit=model_concurrency_limit,
+            concurrency_id="model-gpu",
         )
 
         generate_btn.click(
@@ -1350,11 +1999,13 @@ def build_ui():
         )
         generate_btn.click(
             fn=on_generate_cutout,
-            inputs=[canvas_img, engine_mode,
+            inputs=[canvas_img, engine_mode, tab2_output_mode,
                     points_state, labels_state, box_state,
                     canvas_preserve_transparency, canvas_save_debug],
             outputs=[result_img, result_view_btn, cutout_status],
             stream_every=0.5,
+            concurrency_limit=model_concurrency_limit,
+            concurrency_id="model-gpu",
         )
 
         clear_btn.click(
@@ -1369,20 +2020,78 @@ def build_ui():
     return demo
 
 
+def _parse_cli_args():
+    parser = argparse.ArgumentParser(description="AI 抠图工具 Web UI")
+    parser.add_argument(
+        "-p", "--port",
+        type=int,
+        default=18181,
+        help="监听端口（默认 18181）",
+    )
+    parser.add_argument(
+        "-q", "--silent",
+        action="store_true",
+        help="静默启动：不自动打开浏览器，并减少控制台输出",
+    )
+    parser.add_argument(
+        "--model-concurrency",
+        type=int,
+        default=None,
+        help="模型推理并发数；默认单 session 为 1，多 session 为 2",
+    )
+    parser.add_argument(
+        "--queue-size",
+        type=int,
+        default=32,
+        help="等待队列最大长度（默认 32）",
+    )
+    parser.add_argument(
+        "--max-sam-sessions",
+        type=int,
+        default=8,
+        help="多 session 时最多保留的独立 SAM 会话状态数量（默认 8）",
+    )
+    parser.add_argument(
+        "--multi-session",
+        action="store_true",
+        help="启用多人/多标签页隔离和模型常驻缓存；默认单 session 低显存模式",
+    )
+    return parser.parse_args()
+
+
 # ── __main__ 启动 ───────────────────────────────────────────────
 if __name__ == "__main__":
-    demo = build_ui()
+    args = _parse_cli_args()
+    _startup_log("parse args")
+    _configure_runtime(args.multi_session, args.max_sam_sessions)
+    _startup_log("configure runtime")
+    model_concurrency = (
+        args.model_concurrency
+        if args.model_concurrency is not None
+        else (2 if args.multi_session else 1)
+    )
+    start_default_model_warmup()
+    _startup_log("start warmup thread")
+    demo = build_ui(model_concurrency_limit=max(1, model_concurrency))
+    _startup_log("warmup overlap checkpoint")
+    _startup_log("build ui")
+    demo.queue(
+        default_concurrency_limit=max(1, model_concurrency),
+        max_size=max(1, args.queue_size),
+    )
+    _startup_log("configure queue")
     demo.launch(
         server_name="127.0.0.1",
-        server_port=7860,
-        inbrowser=True,
+        server_port=args.port,
+        inbrowser=not args.silent,
+        quiet=args.silent,
         share=False,
         prevent_thread_lock=True,
         theme=gr.themes.Soft(),
         css=APP_CSS,
         js=APP_JS,
     )
-    start_default_model_warmup()
+    _startup_log("launch gradio")
 
 
     # 信号处理

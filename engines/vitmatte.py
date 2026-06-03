@@ -4,6 +4,7 @@ ViTMatte 引擎：基于 Trimap 的 alpha matte 精细化
 """
 import os
 import time
+import threading
 
 import cv2
 import numpy as np
@@ -25,46 +26,52 @@ class ViTMatteRefiner:
         self._trimap_erode = 1
         self._trimap_dilate = 3
         self._trimap_kernel = 7
+        self._load_lock = threading.Lock()
+        self._infer_lock = threading.Lock()
 
     def _load_model(self):
         if self.model is not None:
             return
-        from transformers import VitMatteForImageMatting, VitMatteImageProcessor
+        with self._load_lock:
+            if self.model is not None:
+                return
+            from transformers import VitMatteForImageMatting, VitMatteImageProcessor
 
-        local_path = self.model_path
-        safetensors = os.path.join(local_path, "model.safetensors")
-        d2_ckpt = os.path.join(local_path, "ViTMatte_B_DIS.pth")
+            local_path = self.model_path
+            safetensors = os.path.join(local_path, "model.safetensors")
+            d2_ckpt = os.path.join(local_path, "ViTMatte_B_DIS.pth")
 
-        if os.path.isfile(safetensors):
-            self.processor = VitMatteImageProcessor.from_pretrained(local_path)
-            self.model = VitMatteForImageMatting.from_pretrained(local_path)
-        elif os.path.isfile(d2_ckpt):
-            # MatAny: detectron2 权重加载到 transformers 模型骨架
-            print(f"[ViTMatte] 从 detectron2 加载: {d2_ckpt}")
-            base_repo = "hustvl/vitmatte-base-distinctions-646"
-            self.model = VitMatteForImageMatting.from_pretrained(base_repo)
-            self._load_detectron2_weights(d2_ckpt)
-            self.model.save_pretrained(local_path)
-            # processor 配置跟 Base 一样，复制过来（save_pretrained 不保存 processor）
-            import shutil
-            base_local = os.path.join(os.path.dirname(local_path), "vitmatte-base")
-            proc_src = os.path.join(base_local, "preprocessor_config.json")
-            if os.path.isfile(proc_src):
-                shutil.copy2(proc_src, os.path.join(local_path, "preprocessor_config.json"))
-            self.processor = VitMatteImageProcessor.from_pretrained(local_path)
-            print(f"[ViTMatte] 已缓存到: {local_path}")
-        else:
-            local_path = self._ensure_local(local_path)
-            self.processor = VitMatteImageProcessor.from_pretrained(local_path)
-            self.model = VitMatteForImageMatting.from_pretrained(local_path)
+            if os.path.isfile(safetensors):
+                self.processor = VitMatteImageProcessor.from_pretrained(local_path)
+                self.model = VitMatteForImageMatting.from_pretrained(local_path)
+            elif os.path.isfile(d2_ckpt):
+                # MatAny: detectron2 权重加载到 transformers 模型骨架
+                print(f"[ViTMatte] 从 detectron2 加载: {d2_ckpt}")
+                base_repo = "hustvl/vitmatte-base-distinctions-646"
+                self.model = VitMatteForImageMatting.from_pretrained(base_repo)
+                self._load_detectron2_weights(d2_ckpt)
+                self.model.save_pretrained(local_path)
+                # processor 配置跟 Base 一样，复制过来（save_pretrained 不保存 processor）
+                import shutil
+                base_local = os.path.join(os.path.dirname(local_path), "vitmatte-base")
+                proc_src = os.path.join(base_local, "preprocessor_config.json")
+                if os.path.isfile(proc_src):
+                    shutil.copy2(proc_src, os.path.join(local_path, "preprocessor_config.json"))
+                self.processor = VitMatteImageProcessor.from_pretrained(local_path)
+                print(f"[ViTMatte] 已缓存到: {local_path}")
+            else:
+                local_path = self._ensure_local(local_path)
+                self.processor = VitMatteImageProcessor.from_pretrained(local_path)
+                self.model = VitMatteForImageMatting.from_pretrained(local_path)
 
-        self._patch_attention()
-        self.model.float().to(self.device).eval()
-        if torch.cuda.is_available():
-            allocated = torch.cuda.memory_allocated() / 1024**3
-            reserved = torch.cuda.memory_reserved() / 1024**3
-            print(f"[VRAM] ViTMatte loaded — allocated: {allocated:.2f}GB, reserved: {reserved:.2f}GB")
-        print("[ViTMatte] 模型加载完成")
+            self._patch_attention()
+            self.model.float().to(self.device).eval()
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated() / 1024**3
+                reserved = torch.cuda.memory_reserved() / 1024**3
+                print(f"[VRAM] ViTMatte loaded — allocated: {allocated:.2f}GB, reserved: {reserved:.2f}GB")
+            print("[ViTMatte] 模型加载完成")
+
 
     def _load_detectron2_weights(self, ckpt_path: str):
         """加载 detectron2 backbone 权重到 transformers 模型"""
@@ -257,6 +264,20 @@ class ViTMatteRefiner:
         Returns:
             精细化后的 HxW uint8 alpha [0,255]
         """
+        with self._infer_lock:
+            return self._refine_locked(
+                image,
+                alpha,
+                transparent_detector=transparent_detector,
+                transparent_boxes=transparent_boxes,
+                soft=soft,
+                mode=mode,
+                _debug_dir=_debug_dir,
+            )
+
+    def _refine_locked(self, image, alpha: np.ndarray, transparent_detector=None,
+                       transparent_boxes=None, soft: bool = False,
+                       mode: str = "auto", _debug_dir: str = None) -> np.ndarray:
         self._load_model()
         # 始终跑模型原生注意力（window+global），不用降质的 strided 省显存近似。
         self._set_strided(enabled=False)
@@ -264,9 +285,9 @@ class ViTMatteRefiner:
         # RMBG already provides a soft alpha. Keep the unknown band narrow so
         # ViTMatte refines the edge instead of hallucinating a broad matte.
         if soft:
-            self._trimap_erode, self._trimap_dilate, self._trimap_kernel = 1, 3, 7
+            trimap_erode, trimap_dilate, trimap_kernel = 1, 3, 7
         else:
-            self._trimap_erode, self._trimap_dilate, self._trimap_kernel = 2, 4, 7
+            trimap_erode, trimap_dilate, trimap_kernel = 2, 4, 7
 
         if isinstance(image, np.ndarray):
             image = Image.fromarray(image)
@@ -274,9 +295,9 @@ class ViTMatteRefiner:
         full_h, full_w = img_np.shape[:2]
 
         trimap = self._make_trimap(alpha, soft=soft,
-                                    erode=self._trimap_erode,
-                                    dilate=self._trimap_dilate,
-                                    kernel_size=self._trimap_kernel)
+                                    erode=trimap_erode,
+                                    dilate=trimap_dilate,
+                                    kernel_size=trimap_kernel)
         boxes = transparent_boxes
         if boxes is None and transparent_detector is not None:
             boxes = transparent_detector.detect(image)
@@ -504,8 +525,9 @@ class ViTMatteRefiner:
         )
 
     def cleanup(self):
-        if self.model is not None:
-            del self.model
-            del self.processor
-            self.model = None
-            self.processor = None
+        with self._infer_lock, self._load_lock:
+            if self.model is not None:
+                del self.model
+                del self.processor
+                self.model = None
+                self.processor = None

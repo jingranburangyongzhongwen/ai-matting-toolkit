@@ -103,13 +103,19 @@ class ModelManager:
 
     def __init__(self):
         self._device = None
+        self._model_lock = threading.RLock()
         self._rmbg2_lock = threading.Lock()
         self._rmbg2_engine = None
+        self._vitmatte_engines = {}
         self._vitmatte_engine = None
         self._vitmatte_variant = None
         self._grounding_dino_engine = None
-        self._sam_engine = None
-        self._sam_engine_type = None
+        self._sam_models = {}
+        self._multi_session_mode = False
+
+    def set_multi_session_mode(self, enabled: bool):
+        """单 session 低显存优先；多 session 保留多模型缓存避免互相卸载。"""
+        self._multi_session_mode = bool(enabled)
 
     @property
     def device(self):
@@ -139,9 +145,7 @@ class ModelManager:
     @property
     def vitmatte(self):
         """懒加载 ViTMatte 精细化引擎（默认 Base，与 Matte-Anything 对齐）"""
-        if self._vitmatte_engine is None:
-            self._load_vitmatte_engine("base")
-        return self._vitmatte_engine
+        return self.get_vitmatte("base")
 
     def _load_vitmatte_engine(self, variant: str):
         from engines.vitmatte import ViTMatteRefiner
@@ -163,81 +167,87 @@ class ModelManager:
                     "https://drive.google.com/file/d/1d97oKuITCeWgai2Tf3iNilt6rMSSYzkW\n"
                     "文件名: ViTMatte_B_DIS.pth（首次加载自动转换，之后秒加载）"
                 )
-        self._vitmatte_engine = ViTMatteRefiner(
+        engine = ViTMatteRefiner(
             model_path=os.path.join(get_models_path(), model_dir),
             device=self.device,
             hf_repo=hf_repo,
             is_matany=(variant == "matany"),
         )
+        self._vitmatte_engines[variant] = engine
+        self._vitmatte_engine = engine
         self._vitmatte_variant = variant
 
+    def get_vitmatte(self, variant: str):
+        """获取指定 ViTMatte 变体；单 session 卸载旧变体，多 session 常驻缓存。"""
+        if variant == "none":
+            return None
+        with self._model_lock:
+            removed_old = False
+            if not self._multi_session_mode:
+                for old_variant, old_engine in list(self._vitmatte_engines.items()):
+                    if old_variant == variant:
+                        continue
+                    old_engine.cleanup()
+                    del self._vitmatte_engines[old_variant]
+                    removed_old = True
+                if removed_old:
+                    clear_gpu_cache()
+            engine = self._vitmatte_engines.get(variant)
+            if engine is None:
+                self._load_vitmatte_engine(variant)
+                engine = self._vitmatte_engines[variant]
+            self._vitmatte_engine = engine
+            self._vitmatte_variant = variant
+            return engine
+
     def switch_vitmatte(self, variant: str) -> bool:
-        """切换 ViTMatte 变体（small / matany / base）。返回是否切换了。"""
-        if self._vitmatte_variant == variant and self._vitmatte_engine is not None:
-            return False
-        if self._vitmatte_engine is not None:
-            self._vitmatte_engine.cleanup()
-            del self._vitmatte_engine
-            self._vitmatte_engine = None
-            self._vitmatte_variant = None
-            clear_gpu_cache()
-        self._load_vitmatte_engine(variant)
-        return True
+        """兼容旧调用：加载目标变体，是否卸载旧变体由运行模式决定。"""
+        before = self._vitmatte_variant
+        self.get_vitmatte(variant)
+        return before != variant
 
     @property
     def grounding_dino(self):
         """懒加载 Grounding-DINO 透明物体检测引擎"""
-        if self._grounding_dino_engine is None:
-            from engines.grounding_dino import GroundingDinoDetector
-            self._grounding_dino_engine = GroundingDinoDetector(
-                model_path=os.path.join(get_models_path(), "grounding-dino-tiny"),
-                device=self.device,
-            )
+        with self._model_lock:
+            if self._grounding_dino_engine is None:
+                from engines.grounding_dino import GroundingDinoDetector
+                self._grounding_dino_engine = GroundingDinoDetector(
+                    model_path=os.path.join(get_models_path(), "grounding-dino-tiny"),
+                    device=self.device,
+                )
         return self._grounding_dino_engine
 
     @property
     def vitmatte_loaded(self) -> bool:
         """ViTMatte 是否已加载（用于 UI 判断要不要显示下载提示）"""
-        return self._vitmatte_engine is not None
+        return bool(self._vitmatte_engines)
 
     @property
     def grounding_dino_loaded(self) -> bool:
         """Grounding-DINO 是否已加载"""
         return self._grounding_dino_engine is not None
 
-    @property
-    def sam(self):
-        """返回当前激活的 SAM 引擎（默认 MobileSAM）"""
-        if self._sam_engine is None:
-            self._load_sam_engine("mobile_sam")
-        return self._sam_engine
-
-    def _load_sam_engine(self, engine_type: str):
-        """加载指定类型的 SAM 引擎"""
+    def _create_sam_engine(self, engine_type: str):
+        """创建指定类型的 SAM 引擎；模型权重可被后续 session predictor 共享。"""
         config = ENGINE_CONFIGS[engine_type]
         import importlib
         module = importlib.import_module(config["module"])
         engine_class = getattr(module, config["class"])
-        self._sam_engine = engine_class(
+        return engine_class(
             model_path=os.path.join(get_models_path(), config["model_path"]),
             device=self.device,
         )
-        self._sam_engine_type = engine_type
 
-    def switch_sam(self, engine_type: str) -> bool:
-        """切换 SAM 引擎类型，卸载旧引擎，加载新引擎。返回是否切换了。"""
-        if self._sam_engine_type == engine_type and self._sam_engine is not None:
-            return False  # 已经是目标引擎，无需切换
-        # 卸载旧引擎
-        if self._sam_engine is not None:
-            self._sam_engine.cleanup()
-            del self._sam_engine
-            self._sam_engine = None
-            self._sam_engine_type = None
-            clear_gpu_cache()
-        # 加载新引擎
-        self._load_sam_engine(engine_type)
-        return True
+    def get_sam_engine(self, engine_type: str):
+        """获取某类 SAM 的共享只读模型容器；单 session 仅保留当前类型。"""
+        with self._model_lock:
+            engine = self._sam_models.get(engine_type)
+            if engine is None:
+                engine = self._create_sam_engine(engine_type)
+                engine._load_model()
+                self._sam_models[engine_type] = engine
+            return engine
 
     def unload_rmbg2(self):
         """卸载 RMBG-2.0 释放内存"""
@@ -249,26 +259,37 @@ class ModelManager:
 
     def unload_grounding_dino(self):
         """卸载 Grounding-DINO 释放显存"""
-        if self._grounding_dino_engine is not None:
-            self._grounding_dino_engine.cleanup()
-            del self._grounding_dino_engine
-            self._grounding_dino_engine = None
-            clear_gpu_cache()
+        with self._model_lock:
+            if self._grounding_dino_engine is not None:
+                self._grounding_dino_engine.cleanup()
+                del self._grounding_dino_engine
+                self._grounding_dino_engine = None
+                clear_gpu_cache()
 
     def unload_vitmatte(self):
         """卸载 ViTMatte 释放显存"""
-        if self._vitmatte_engine is not None:
-            self._vitmatte_engine.cleanup()
-            del self._vitmatte_engine
-            self._vitmatte_engine = None
-            self._vitmatte_variant = None
-            clear_gpu_cache()
+        with self._model_lock:
+            if self._vitmatte_engines:
+                for engine in self._vitmatte_engines.values():
+                    engine.cleanup()
+                self._vitmatte_engines.clear()
+                self._vitmatte_engine = None
+                self._vitmatte_variant = None
+                clear_gpu_cache()
 
     def unload_sam(self):
         """卸载 SAM 引擎释放内存"""
-        if self._sam_engine is not None:
-            self._sam_engine.cleanup()
-            del self._sam_engine
-            self._sam_engine = None
-            self._sam_engine_type = None
-            clear_gpu_cache()
+        with self._model_lock:
+            if self._sam_models:
+                for engine in self._sam_models.values():
+                    engine.cleanup()
+                self._sam_models.clear()
+                clear_gpu_cache()
+
+    def unload_sam_engine(self, engine_type: str):
+        """卸载某个 SAM 模型容器；调用方需确保没有 session 正在使用它。"""
+        with self._model_lock:
+            engine = self._sam_models.pop(engine_type, None)
+            if engine is not None:
+                engine.cleanup()
+                clear_gpu_cache()
