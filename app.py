@@ -281,13 +281,13 @@ def _unload_sam_and_reset_state():
 
 def on_auto_process(files, source_img, detect_transparent, vitmatte_variant,
                     process_mode, save_debug=False):
-    """generator，yield (preview_img, status_text, result_img, result_view_btn)"""
+    """generator，yield (preview_img, status_text, result_img, result_view_btn, result_download_btn)"""
     if not files:
         # 原图区没有内容时完全不改动界面。
-        yield gr.update(), gr.update(), gr.update(), gr.update()
+        yield gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
         return
     if not _has_source_content(source_img):
-        yield gr.update(), "请等待原图预览加载完成", gr.update(), gr.update()
+        yield gr.update(), "请等待原图预览加载完成", gr.update(), gr.update(), gr.update()
         return
 
     # 映射 ViTMatte 变体
@@ -315,15 +315,15 @@ def on_auto_process(files, source_img, detect_transparent, vitmatte_variant,
         try:
             refiner = mgr.get_vitmatte(variant_key)
         except FileNotFoundError as e:
-            yield gr.update(), f"模型加载失败: {e}", gr.update(), gr.update(visible=False)
+            yield gr.update(), f"模型加载失败: {e}", gr.update(), gr.update(visible=False), gr.update(visible=False)
             return
-        yield gr.update(), f"ViTMatte ({variant_key}) 已加载", gr.update(), gr.update(visible=False)
+        yield gr.update(), f"ViTMatte ({variant_key}) 已加载", gr.update(), gr.update(visible=False), gr.update(visible=False)
 
     # 透明物体检测器
     detector = None
     if detect_transparent:
         detector = mgr.grounding_dino
-        yield gr.update(), "Grounding-DINO 已加载，开始处理...", gr.update(), gr.update(visible=False)
+        yield gr.update(), "Grounding-DINO 已加载，开始处理...", gr.update(), gr.update(visible=False), gr.update(visible=False)
 
     output_dir = get_output_path()
     total = len(files)
@@ -338,7 +338,7 @@ def on_auto_process(files, source_img, detect_transparent, vitmatte_variant,
 
         fname = os.path.basename(str(f))
         # 只更新状态文字；原图/结果图保持现状，避免无谓的全图重编码重传。
-        yield gr.update(), f"[{idx + 1}/{total}] 正在处理: {fname}", gr.update(), gr.update(visible=(last_result is not None))
+        yield gr.update(), f"[{idx + 1}/{total}] 正在处理: {fname}", gr.update(), gr.update(visible=(last_result is not None)), gr.update(visible=(last_result is not None))
 
         try:
             img = Image.open(f).convert("RGB")
@@ -359,7 +359,7 @@ def on_auto_process(files, source_img, detect_transparent, vitmatte_variant,
 
         last_original = np.array(img)
         # 原图只在这里传一次。
-        yield last_original, f"[{idx + 1}/{total}] RMBG-2.0 推理中: {fname}", gr.update(), gr.update(visible=(last_result is not None))
+        yield last_original, f"[{idx + 1}/{total}] RMBG-2.0 推理中: {fname}", gr.update(), gr.update(visible=(last_result is not None)), gr.update(visible=(last_result is not None))
 
         result = mgr.rmbg2.remove_background(
             img,
@@ -371,9 +371,9 @@ def on_auto_process(files, source_img, detect_transparent, vitmatte_variant,
 
         result.save(out_path)
 
-        last_result = result
+        last_result = out_path
         # 结果图只在这里传一次；原图不重传。
-        yield gr.update(), f"[{idx + 1}/{total}] 完成: {fname} → {os.path.basename(out_path)}", result, gr.update(visible=True)
+        yield gr.update(), f"[{idx + 1}/{total}] 完成: {fname} → {os.path.basename(out_path)}", result, gr.update(visible=True), gr.update(value=out_path, visible=True)
 
         # 清理
         del img
@@ -383,9 +383,9 @@ def on_auto_process(files, source_img, detect_transparent, vitmatte_variant,
     if last_result is not None:
         done_msg = f"全部完成，共处理 {total} 张，结果保存在 output/"
         # 汇总只更新状态文字；图片已展示，不再重传。
-        yield gr.update(), done_msg, gr.update(), gr.update(visible=True)
+        yield gr.update(), done_msg, gr.update(), gr.update(visible=True), gr.update(visible=True)
     else:
-        yield gr.update(), "没有有效图片被处理", gr.update(), gr.update(visible=False)
+        yield gr.update(), "没有有效图片被处理", gr.update(), gr.update(visible=False), gr.update(visible=False)
 
 
 def on_auto_upload(files):
@@ -393,24 +393,24 @@ def on_auto_upload(files):
     if not files:
         return gr.update(value=None, visible=True), gr.update(value=None, visible=False), \
             gr.update(visible=False), gr.update(visible=False), None, \
-            gr.update(visible=False), "请先上传图片"
+            gr.update(visible=False), gr.update(value=None, visible=False), "请先上传图片"
     first = files[0] if isinstance(files, list) else files
     try:
         img = Image.open(first).convert("RGB")
         return gr.update(visible=False), gr.update(value=np.array(img), visible=True), \
             gr.update(visible=True), gr.update(visible=True), None, \
-            gr.update(visible=False), "图片已上传，点击开始抠图"
+            gr.update(visible=False), gr.update(value=None, visible=False), "图片已上传，点击开始抠图"
     except Exception:
         return gr.update(value=None, visible=True), gr.update(value=None, visible=False), \
             gr.update(visible=False), gr.update(visible=False), None, \
-            gr.update(visible=False), "图片加载失败"
+            gr.update(visible=False), gr.update(value=None, visible=False), "图片加载失败"
 
 
 def on_auto_clear_source():
     """清空原图区：恢复上传提示，隐藏预览和清空按钮。"""
     return gr.update(value=None, visible=True), gr.update(value=None, visible=False), \
         gr.update(visible=False), gr.update(visible=False), None, \
-        gr.update(visible=False), "请先上传图片"
+        gr.update(visible=False), gr.update(value=None, visible=False), "请先上传图片"
 
 
 def _has_source_content(source):
@@ -427,8 +427,8 @@ def _has_source_content(source):
 def clear_result_preview_on_start(source, result):
     """点击开始时快速清空旧预览；无原图或无旧预览则保持界面不变。"""
     if not _has_source_content(source) or result is None:
-        return gr.update(), gr.update()
-    return None, gr.update(visible=False)
+        return gr.update(), gr.update(), gr.update()
+    return None, gr.update(visible=False), gr.update(value=None, visible=False)
 
 
 def on_vitmatte_variant_change(vitmatte_variant):
@@ -798,17 +798,17 @@ def on_image_upload(files, request: gr.Request = None):
     if not files:
         return gr.update(value=None, visible=True), gr.update(value=None, visible=False), \
             gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), \
-            [], [], None, None, "请先上传图片"
+            gr.update(value=None, visible=False), [], [], None, None, "请先上传图片"
     first = files[0] if isinstance(files, list) else files
     try:
         img = Image.open(first).convert("RGB")
         return gr.update(visible=False), gr.update(value=np.array(img), visible=True), \
             gr.update(visible=True), gr.update(visible=True), gr.update(visible=False), \
-            [], [], None, None, "图片已上传，点击图片选取区域或用文本定位"
+            gr.update(value=None, visible=False), [], [], None, None, "图片已上传，点击图片选取区域或用文本定位"
     except Exception:
         return gr.update(value=None, visible=True), gr.update(value=None, visible=False), \
             gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), \
-            [], [], None, None, "图片加载失败"
+            gr.update(value=None, visible=False), [], [], None, None, "图片加载失败"
 
 
 def on_canvas_clear_source(request: gr.Request = None):
@@ -816,17 +816,17 @@ def on_canvas_clear_source(request: gr.Request = None):
     _clear_session_sam_contexts(request)
     return gr.update(value=None, visible=True), gr.update(value=None, visible=False), \
         gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), \
-        [], [], None, None, "请先上传图片"
+        gr.update(value=None, visible=False), [], [], None, None, "请先上传图片"
 
 
 def on_image_click(image, evt: gr.SelectData, mode, engine_mode, text_locate_enabled,
                    points_state, labels_state, box_state, request: gr.Request = None):
     if image is None:
-        return image, gr.update(visible=False), points_state, labels_state, box_state, "请先上传图片"
+        return image, gr.update(visible=False), gr.update(value=None, visible=False), points_state, labels_state, box_state, "请先上传图片"
     try:
         x, y = evt.index[0], evt.index[1]
     except Exception:
-        return image, gr.update(visible=False), points_state, labels_state, box_state, "无法获取点击坐标"
+        return image, gr.update(visible=False), gr.update(value=None, visible=False), points_state, labels_state, box_state, "无法获取点击坐标"
 
     label = 1 if mode == "正向选取（我要）" else 0
     new_points = list(points_state) + [[x, y]]
@@ -849,16 +849,16 @@ def on_image_click(image, evt: gr.SelectData, mode, engine_mode, text_locate_ena
         )
         tag = "正向" if label == 1 else "负向"
         status = f"已添加{tag}标记 ({x}, {y})，共 {len(new_points)} 个点"
-        return overlay, gr.update(visible=True), new_points, new_labels, box_state, status
+        return overlay, gr.update(visible=True), gr.update(value=None, visible=False), new_points, new_labels, box_state, status
     except Exception as e:
-        return image, gr.update(visible=False), new_points, new_labels, box_state, f"预测失败: {e}"
+        return image, gr.update(visible=False), gr.update(value=None, visible=False), new_points, new_labels, box_state, f"预测失败: {e}"
 
 
 def on_text_locate(image, caption, engine_mode, request: gr.Request = None):
     if image is None:
-        return None, gr.update(visible=False), [], [], None, "请先上传图片"
+        return None, gr.update(visible=False), gr.update(value=None, visible=False), [], [], None, "请先上传图片"
     if not caption or not caption.strip():
-        return image, gr.update(visible=False), [], [], None, "请输入定位描述"
+        return image, gr.update(visible=False), gr.update(value=None, visible=False), [], [], None, "请输入定位描述"
 
     try:
         caption_for_dino = caption.strip()
@@ -873,14 +873,14 @@ def on_text_locate(image, caption, engine_mode, request: gr.Request = None):
             return_scores=True,
         )
         if not boxes:
-            return image, gr.update(visible=False), [], [], None, "未找到匹配物体"
+            return image, gr.update(visible=False), gr.update(value=None, visible=False), [], [], None, "未找到匹配物体"
 
         h, w = image.shape[:2]
         boxes, scores, filter_stats = _filter_text_candidate_boxes(
             boxes, scores, image.shape, max_prompts=8
         )
         if not boxes:
-            return image, gr.update(visible=False), [], [], None, "候选框过滤后为空，请换个描述"
+            return image, gr.update(visible=False), gr.update(value=None, visible=False), [], [], None, "候选框过滤后为空，请换个描述"
 
         prompt_boxes = []
         for box_raw in boxes:
@@ -922,9 +922,9 @@ def on_text_locate(image, caption, engine_mode, request: gr.Request = None):
             f"文本定位: '{caption}' → {len(prompt_boxes)} 个候选框 "
             f"score={score_text}{score_note}{filter_text}{cap_text}；可继续加正/负点修正"
         )
-        return overlay, gr.update(visible=True), [], [], prompt_boxes, status
+        return overlay, gr.update(visible=True), gr.update(value=None, visible=False), [], [], prompt_boxes, status
     except Exception as e:
-        return image, gr.update(visible=False), [], [], None, f"定位失败: {e}"
+        return image, gr.update(visible=False), gr.update(value=None, visible=False), [], [], None, f"定位失败: {e}"
 
 
 def _odd_kernel(value, min_value, max_value):
@@ -1163,17 +1163,17 @@ def _sam_guided_rmbg_alpha(image: np.ndarray, sam_mask: np.ndarray,
 def on_generate_cutout(image, engine_mode, output_mode, points_state,
                        labels_state, box_state, preserve_transparency=False,
                        save_debug=False, request: gr.Request = None):
-    """generator，yield (result_img, result_view_btn, status_text)"""
+    """generator，yield (result_img, result_view_btn, result_download_btn, status_text)"""
     if image is None:
-        yield gr.update(), gr.update(), gr.update()
+        yield gr.update(), gr.update(), gr.update(value=None, visible=False), gr.update()
         return
     if not points_state and not _box_state_has_boxes(box_state):
-        yield gr.update(), gr.update(), "请先标记区域或用文本定位"
+        yield gr.update(), gr.update(), gr.update(value=None, visible=False), "请先标记区域或用文本定位"
         return
 
     try:
         # SAM 分割（优先用交互 overlay 缓存的 mask，保证一致）
-        yield gr.update(), gr.update(), "SAM 分割中..."
+        yield gr.update(), gr.update(), gr.update(value=None, visible=False), "SAM 分割中..."
         ctx = _ensure_sam_ready(image, engine_mode, request=request, retain=True)
         try:
             mask = _predict_tab2_mask(ctx, points_state, labels_state, box_state)
@@ -1185,12 +1185,12 @@ def on_generate_cutout(image, engine_mode, output_mode, points_state,
         roi_box = None
         if mode_key == "rmbg_refine":
             # Optional soft-alpha path: SAM selects the subject, RMBG may still alter edges.
-            yield gr.update(), gr.update(), "RMBG-2.0 ROI 精修中..."
+            yield gr.update(), gr.update(), gr.update(value=None, visible=False), "RMBG-2.0 ROI 精修中..."
             alpha, subject_box, roi_box, quality_notes = _sam_guided_rmbg_alpha(
                 image, mask, points_state, labels_state, box_state
             )
         else:
-            yield gr.update(), gr.update(), "SAM 严格选区输出中..."
+            yield gr.update(), gr.update(), gr.update(value=None, visible=False), "SAM 严格选区输出中..."
             alpha, subject_box = _sam_strict_alpha(
                 mask, points_state, labels_state, box_state, image.shape
             )
@@ -1226,28 +1226,28 @@ def on_generate_cutout(image, engine_mode, output_mode, points_state,
         if roi_box is not None:
             rx1, ry1, rx2, ry2 = roi_box
             roi_text = f"，RMBG扩边ROI: [{rx1},{ry1},{rx2},{ry2}]"
-        yield result, gr.update(visible=True), (
+        yield result, gr.update(visible=True), gr.update(value=out_path, visible=True), (
             f"完成！已保存到 {os.path.basename(out_path)}\n"
             f"SAM主体框: [{sx1},{sy1},{sx2},{sy2}]{roi_text}"
             f"{note_text}"
         )
     except Exception as e:
-        yield gr.update(), gr.update(), f"生成失败: {e}"
+        yield gr.update(), gr.update(), gr.update(value=None, visible=False), f"生成失败: {e}"
 
 
 def on_clear_points(image, request: gr.Request = None):
     if image is None:
-        return None, gr.update(visible=False), [], [], None, "请先上传图片"
+        return None, gr.update(visible=False), gr.update(value=None, visible=False), [], [], None, "请先上传图片"
     _reset_session_sam_interaction_state(request)
-    return None, gr.update(visible=False), [], [], None, "标记和文本定位已清除"
+    return None, gr.update(visible=False), gr.update(value=None, visible=False), [], [], None, "标记和文本定位已清除"
 
 
 def on_engine_mode_change(image, request: gr.Request = None):
     """切换 SAM 引擎后清空旧选区预览，避免新旧引擎结果混淆。"""
     _clear_session_sam_contexts(request)
     if image is None:
-        return None, gr.update(visible=False), [], [], None, "请先上传图片"
-    return None, gr.update(visible=False), [], [], None, "引擎已切换，请重新标记"
+        return None, gr.update(visible=False), gr.update(value=None, visible=False), [], [], None, "请先上传图片"
+    return None, gr.update(visible=False), gr.update(value=None, visible=False), [], [], None, "引擎已切换，请重新标记"
 
 
 # ── APP_CSS 样式 ────────────────────────────────────────────────
@@ -1753,6 +1753,7 @@ def build_ui(model_concurrency_limit=2):
                     auto_result_img = gr.Image(
                         label="效果预览",
                         interactive=False,
+                        buttons=[],
                         elem_classes="checkerboard",
                     )
                     with gr.Row(elem_classes="preview-actions"):
@@ -1760,6 +1761,11 @@ def build_ui(model_concurrency_limit=2):
                             "查看大图",
                             visible=False,
                             elem_classes=["btn-secondary", "preview-open-btn"],
+                        )
+                        auto_result_download_btn = gr.DownloadButton(
+                            "下载",
+                            visible=False,
+                            elem_classes="btn-secondary",
                         )
 
         # ==================== Tab 2: 精细选区 ====================
@@ -1876,6 +1882,7 @@ def build_ui(model_concurrency_limit=2):
                     result_img = gr.Image(
                         label="效果预览",
                         interactive=False,
+                        buttons=[],
                         elem_classes="checkerboard",
                     )
                     with gr.Row(elem_classes="preview-actions"):
@@ -1883,6 +1890,11 @@ def build_ui(model_concurrency_limit=2):
                             "查看大图",
                             visible=False,
                             elem_classes=["btn-secondary", "preview-open-btn"],
+                        )
+                        result_download_btn = gr.DownloadButton(
+                            "下载",
+                            visible=False,
+                            elem_classes="btn-secondary",
                         )
 
             # State
@@ -1898,7 +1910,7 @@ def build_ui(model_concurrency_limit=2):
             inputs=[auto_files],
             outputs=[auto_files, auto_input_img, auto_input_view_btn,
                      auto_swap_btn, auto_result_img, auto_result_view_btn,
-                     auto_status],
+                     auto_result_download_btn, auto_status],
             queue=False,
             show_progress="hidden",
         )
@@ -1906,7 +1918,7 @@ def build_ui(model_concurrency_limit=2):
             fn=on_auto_clear_source,
             outputs=[auto_files, auto_input_img, auto_input_view_btn,
                      auto_swap_btn, auto_result_img, auto_result_view_btn,
-                     auto_status],
+                     auto_result_download_btn, auto_status],
             queue=False,
             show_progress="hidden",
         )
@@ -1921,7 +1933,8 @@ def build_ui(model_concurrency_limit=2):
         auto_btn.click(
             fn=clear_result_preview_on_start,
             inputs=[auto_input_img, auto_result_img],
-            outputs=[auto_result_img, auto_result_view_btn],
+            outputs=[auto_result_img, auto_result_view_btn,
+                     auto_result_download_btn],
             queue=False,
             show_progress="hidden",
         )
@@ -1930,7 +1943,7 @@ def build_ui(model_concurrency_limit=2):
             inputs=[auto_files, auto_input_img, detect_transparent,
                     vitmatte_variant, process_mode, save_debug],
             outputs=[auto_input_img, auto_status, auto_result_img,
-                     auto_result_view_btn],
+                     auto_result_view_btn, auto_result_download_btn],
             stream_every=0.5,
             concurrency_limit=model_concurrency_limit,
             concurrency_id="model-gpu",
@@ -1947,8 +1960,8 @@ def build_ui(model_concurrency_limit=2):
         engine_mode.change(
             fn=on_engine_mode_change,
             inputs=[canvas_img],
-            outputs=[result_img, result_view_btn, points_state, labels_state,
-                     box_state, cutout_status],
+            outputs=[result_img, result_view_btn, result_download_btn,
+                     points_state, labels_state, box_state, cutout_status],
             queue=False,
             show_progress="hidden",
         )
@@ -1957,16 +1970,18 @@ def build_ui(model_concurrency_limit=2):
             fn=on_image_upload,
             inputs=[canvas_files],
             outputs=[canvas_files, canvas_img, canvas_view_btn,
-                     canvas_swap_btn, result_view_btn, points_state,
-                     labels_state, box_state, result_img, cutout_status],
+                     canvas_swap_btn, result_view_btn, result_download_btn,
+                     points_state, labels_state, box_state, result_img,
+                     cutout_status],
             queue=False,
             show_progress="hidden",
         )
         canvas_swap_btn.click(
             fn=on_canvas_clear_source,
             outputs=[canvas_files, canvas_img, canvas_view_btn,
-                     canvas_swap_btn, result_view_btn, points_state,
-                     labels_state, box_state, result_img, cutout_status],
+                     canvas_swap_btn, result_view_btn, result_download_btn,
+                     points_state, labels_state, box_state, result_img,
+                     cutout_status],
             queue=False,
             show_progress="hidden",
         )
@@ -1974,8 +1989,8 @@ def build_ui(model_concurrency_limit=2):
         locate_btn.click(
             fn=on_text_locate,
             inputs=[canvas_img, text_caption, engine_mode],
-            outputs=[result_img, result_view_btn, points_state, labels_state,
-                     box_state, cutout_status],
+            outputs=[result_img, result_view_btn, result_download_btn,
+                     points_state, labels_state, box_state, cutout_status],
             concurrency_limit=model_concurrency_limit,
             concurrency_id="model-gpu",
         )
@@ -1984,8 +1999,8 @@ def build_ui(model_concurrency_limit=2):
             fn=on_image_click,
             inputs=[canvas_img, click_mode, engine_mode, use_text_locate,
                     points_state, labels_state, box_state],
-            outputs=[result_img, result_view_btn, points_state, labels_state,
-                     box_state, cutout_status],
+            outputs=[result_img, result_view_btn, result_download_btn,
+                     points_state, labels_state, box_state, cutout_status],
             concurrency_limit=model_concurrency_limit,
             concurrency_id="model-gpu",
         )
@@ -1993,7 +2008,7 @@ def build_ui(model_concurrency_limit=2):
         generate_btn.click(
             fn=clear_result_preview_on_start,
             inputs=[canvas_img, result_img],
-            outputs=[result_img, result_view_btn],
+            outputs=[result_img, result_view_btn, result_download_btn],
             queue=False,
             show_progress="hidden",
         )
@@ -2002,7 +2017,8 @@ def build_ui(model_concurrency_limit=2):
             inputs=[canvas_img, engine_mode, tab2_output_mode,
                     points_state, labels_state, box_state,
                     canvas_preserve_transparency, canvas_save_debug],
-            outputs=[result_img, result_view_btn, cutout_status],
+            outputs=[result_img, result_view_btn, result_download_btn,
+                     cutout_status],
             stream_every=0.5,
             concurrency_limit=model_concurrency_limit,
             concurrency_id="model-gpu",
@@ -2011,8 +2027,8 @@ def build_ui(model_concurrency_limit=2):
         clear_btn.click(
             fn=on_clear_points,
             inputs=[canvas_img],
-            outputs=[result_img, result_view_btn, points_state, labels_state,
-                     box_state, cutout_status],
+            outputs=[result_img, result_view_btn, result_download_btn,
+                     points_state, labels_state, box_state, cutout_status],
             queue=False,
             show_progress="hidden",
         )
@@ -2086,6 +2102,7 @@ if __name__ == "__main__":
         inbrowser=not args.silent,
         quiet=args.silent,
         share=False,
+        allowed_paths=[get_output_path()],
         prevent_thread_lock=True,
         theme=gr.themes.Soft(),
         css=APP_CSS,
