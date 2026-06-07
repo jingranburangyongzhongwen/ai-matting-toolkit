@@ -247,7 +247,7 @@ def _thin_detail_mask(alpha: np.ndarray, solid: np.ndarray) -> np.ndarray:
     return protected
 
 
-def _build_context(image: np.ndarray, alpha: np.ndarray,
+def build_context(image: np.ndarray, alpha: np.ndarray,
                    preserve_transparency: bool = False,
                    full_spill: bool = True) -> Dict[str, np.ndarray]:
     """
@@ -351,7 +351,7 @@ def _build_context(image: np.ndarray, alpha: np.ndarray,
 def analyze_matte(image: np.ndarray, alpha: np.ndarray,
                   preserve_transparency: bool = False,
                   full_spill: bool = True) -> Tuple[MatteProfile, Dict[str, np.ndarray]]:
-    ctx = _build_context(image, alpha, preserve_transparency=preserve_transparency,
+    ctx = build_context(image, alpha, preserve_transparency=preserve_transparency,
                          full_spill=full_spill)
     a = ctx["alpha"]
     alpha_area = int(np.sum(a > 0))
@@ -650,10 +650,24 @@ def _edge_width(ctx: Dict[str, np.ndarray]) -> Tuple[float, float]:
     return float(vals.mean()), float(np.percentile(vals, 95))
 
 
+def _edge_smoothness(alpha: np.ndarray, ctx: Dict[str, np.ndarray]) -> Dict[str, float]:
+    """Laplacian-based edge jaggedness on the fringe band."""
+    fringe = ctx["fringe"]
+    if not np.any(fringe):
+        return {"lap_p95": 0.0, "smooth_score": 0.0}
+    a_f = alpha.astype(np.float32) / 255.0
+    lap = np.abs(cv2.Laplacian(a_f, cv2.CV_32F))
+    vals = lap[fringe]
+    lap_p95 = float(np.percentile(vals, 95)) if vals.size else 0.0
+    return {"lap_p95": lap_p95, "smooth_score": float(np.clip(lap_p95 / 0.3, 0.0, 1.0))}
+
+
 def _dump_stats(profile: MatteProfile, width: Tuple[float, float],
                 guard: Dict[str, float], rollback: bool,
                 strength: np.ndarray, ctx: Dict[str, np.ndarray],
-                rgb_residue: Optional[Dict[str, Dict[str, object]]] = None) -> None:
+                rgb_residue: Optional[Dict[str, Dict[str, object]]] = None,
+                alpha_before: Optional[np.ndarray] = None,
+                alpha_after: Optional[np.ndarray] = None) -> None:
     metrics = ctx.get("defringe_metrics", {})
     active = strength[strength > 0]
     strength_mean = float(active.mean()) if active.size else 0.0
@@ -761,6 +775,19 @@ def _dump_stats(profile: MatteProfile, width: Tuple[float, float],
         "[后处理诊断] 决策: "
         f"profile={profile.profile} alpha_tighten={profile.alpha_tighten} edge_bias={profile.defringe}"
     )
+    if alpha_before is not None:
+        sb = _edge_smoothness(alpha_before, ctx)
+        print(
+            f"[后处理诊断] 边缘平滑: "
+            f"before lap_p95={sb['lap_p95']:.4f} smooth={sb['smooth_score']:.3f}"
+        )
+    if alpha_after is not None:
+        sa = _edge_smoothness(alpha_after, ctx)
+        print(
+            f"[后处理诊断] 边缘平滑: "
+            f"after lap_p95={sa['lap_p95']:.4f} smooth={sa['smooth_score']:.3f} "
+            f"({'差' if sa['smooth_score'] > 0.6 else '中' if sa['smooth_score'] > 0.3 else '好'})"
+        )
 
 
 def _save_debug(debug_dir: str, image: np.ndarray, rgb: np.ndarray,
@@ -878,7 +905,8 @@ def _clean_rgba_core(image_u8: np.ndarray, alpha_u8: np.ndarray, debug_dir: Opti
 
     if debug_dir:
         rgb_residue = _rgb_residue_diagnostics(image_u8, rgb, alpha_refined, ctx)
-        _dump_stats(profile, width, guard, rollback, strength, ctx, rgb_residue)
+        _dump_stats(profile, width, guard, rollback, strength, ctx, rgb_residue,
+                    alpha_before=alpha_u8, alpha_after=alpha_refined)
         _save_debug(debug_dir, image_u8, rgb, alpha_u8, alpha_refined, ctx, strength)
     return np.dstack([rgb, alpha_refined])
 

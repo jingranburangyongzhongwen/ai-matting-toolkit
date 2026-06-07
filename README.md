@@ -56,9 +56,19 @@ flowchart TB
     PP_PROF --> PP_TIGHT[收紧光晕带] --> PP_FIX[过切回滚 + 背景方向去色边] --> PP_RGBA[RGBA PNG]
   end
 
+  subgraph MR["可选 · 边缘修复"]
+    direction LR
+    MR_PAINT[用户涂抹色边] --> MR_MASK[accept_mask]
+    MR_MASK --> MR_TRIMAP[spill-aware trimap]
+    MR_TRIMAP --> MR_VIT[ViTMatte alpha 重估]
+    MR_VIT --> MR_UNMIX[regularized unmix]
+    MR_UNMIX --> MR_MERGE[空间羽化 + 置信度合并] --> MR_OUT[修复后 RGBA]
+  end
+
   M1_A --> PP_IN
   M2_A --> PP_IN
   PP_RGBA --> OUT[(output/)]
+  PP_RGBA --> MR_PAINT
 
   M1_DINO[检测透明物体] -.->|仅 ViTMatte 精修时<br/>修正 trimap| M1_VIT
   M1_DINO -.->|直出时仅后处理保护| PP_ANA
@@ -85,6 +95,31 @@ flowchart TB
 4. （可选）精修模型：默认直出，或 Small / Base / MatAny
 5. （可选）勾选「保存诊断中间结果」
 6. 点击 **开始抠图** → 结果保存到 `output/`（透明 PNG）
+7. 若发丝/边缘有背景色残留，点击 **边缘修复** → 涂抹污染区域 → **应用修复**
+
+### 边缘修复（手动发丝去色边）
+
+当 RMBG 输出的 alpha 在发丝边缘接近实心（alpha≈240-255），但 RGB 仍含背景色（绿幕/蓝幕/红幕残留）时，自动后处理 despill 效果有限。此时可使用**边缘修复**：
+
+1. 一键抠图完成后，右栏出现 **边缘修复** 按钮
+2. 进入修复模式，用红色画笔涂抹可见的色边区域
+3. 点击 **应用修复** — 系统自动：
+   - 构建 accept_mask（仅修复靠近背景的边缘，保护内部）
+   - 用 ViTMatte 在窄带内重估 alpha
+   - 通过 regularized unmix 恢复前景 RGB（去除背景色污染）
+   - 空间羽化 + 置信度门控，平滑合并
+4. 支持**撤销**（回退一次）/ **重置**（回到自动结果）/ **退出修复**
+
+```
+用户涂抹 → accept_mask → spill-aware trimap → ViTMatte alpha
+  → regularized unmix → spatial gate + confidence → 安全合并
+```
+
+**本地测试**（无需启动 UI）：
+
+```bash
+python scripts/test_manual_refine.py
+```
 
 ### 直出 vs ViTMatte 精修
 
@@ -128,6 +163,12 @@ RGBA 后处理不依赖额外 matting solver；RGB 去色边基于 OpenCV/Numpy 
 
 ```bash
 python scripts/verify_rgb_defringe.py
+```
+
+边缘修复自动化测试（需 ViTMatte，GPU ~0.5s/case）：
+
+```bash
+python scripts/test_manual_refine.py
 ```
 ### 运行
 
@@ -247,6 +288,7 @@ A: JPG、PNG、BMP、WEBP、TIFF
 | 自动抠图 | [RMBG-2.0](https://huggingface.co/briaai/RMBG-2.0) | 模式一全图；模式二 ROI alpha |
 | 边缘精修 | [ViTMatte](https://huggingface.co/hustvl/vitmatte-base-distinctions-646) | 仅模式一可选（Small/Base/MatAny） |
 | 输出净化 | `engines/rgba_postprocess` + `engines/rgb_defringe` | 两模式共用：拓扑收边、背景方向去色边、半透明保护 |
+| 手动修复 | `engines/manual_refine` | 涂抹色边 → ViTMatte alpha 重估 + regularized unmix 去背景色污染 |
 | 快速选区 | [MobileSAM](https://github.com/ChaoningZhang/MobileSAM) | 模式二交互与先验 |
 | 高精度选区 | [SAM-HQ](https://github.com/SysCV/sam-hq) | 模式二高精度选区 |
 | 文本定位 | [Grounding-DINO](https://huggingface.co/IDEA-Research/grounding-dino-tiny) | 模式二框选；模式一 ViTMatte+透明检测时修正 trimap |
