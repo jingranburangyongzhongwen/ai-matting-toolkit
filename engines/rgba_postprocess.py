@@ -9,6 +9,17 @@ import cv2
 import numpy as np
 from PIL import Image
 
+from engines.rgb_defringe import background_direction_defringe
+
+
+RGB_DISTANCE_MAX = float(np.sqrt(3.0) * 255.0)
+
+# Spill score normalization. These are tuning gates, not literature constants:
+# keep them named so dataset A/B can adjust behavior without hunting literals.
+SPILL_BG_LIKENESS_OFFSET = 0.018
+SPILL_BG_LIKENESS_WIDTH = 0.18
+ROI_FULL_FRAME_RATIO = 0.92
+
 
 class MatteProfile:
     def __init__(self, **kwargs):
@@ -137,9 +148,13 @@ def _compute_spill_score(image: np.ndarray, foreground_fill: np.ndarray,
         rgb = image.astype(np.float32)
         fg = foreground_fill.astype(np.float32)
         bg = background_fill.astype(np.float32)
-        fg_dist = np.linalg.norm(rgb - fg, axis=2) / 441.7
-        bg_dist = np.linalg.norm(rgb - bg, axis=2) / 441.7
-        bg_like = np.clip((fg_dist - bg_dist - 0.018) / 0.18, 0.0, 1.0)
+        fg_dist = np.linalg.norm(rgb - fg, axis=2) / RGB_DISTANCE_MAX
+        bg_dist = np.linalg.norm(rgb - bg, axis=2) / RGB_DISTANCE_MAX
+        bg_like = np.clip(
+            (fg_dist - bg_dist - SPILL_BG_LIKENESS_OFFSET) / SPILL_BG_LIKENESS_WIDTH,
+            0.0,
+            1.0,
+        )
 
         edge_lum = rgb.mean(axis=2)
         fg_lum = fg.mean(axis=2)
@@ -159,9 +174,13 @@ def _compute_spill_score(image: np.ndarray, foreground_fill: np.ndarray,
     rgb = image.reshape(-1, 3)[idx].astype(np.float32)
     fg = foreground_fill.reshape(-1, 3)[idx].astype(np.float32)
     bg = background_fill.reshape(-1, 3)[idx].astype(np.float32)
-    fg_vals = np.linalg.norm(rgb - fg, axis=1) / 441.7
-    bg_vals = np.linalg.norm(rgb - bg, axis=1) / 441.7
-    bg_like = np.clip((fg_vals - bg_vals - 0.018) / 0.18, 0.0, 1.0)
+    fg_vals = np.linalg.norm(rgb - fg, axis=1) / RGB_DISTANCE_MAX
+    bg_vals = np.linalg.norm(rgb - bg, axis=1) / RGB_DISTANCE_MAX
+    bg_like = np.clip(
+        (fg_vals - bg_vals - SPILL_BG_LIKENESS_OFFSET) / SPILL_BG_LIKENESS_WIDTH,
+        0.0,
+        1.0,
+    )
 
     edge_lum = rgb.mean(axis=1)
     fg_lum = fg.mean(axis=1)
@@ -368,7 +387,7 @@ def analyze_matte(image: np.ndarray, alpha: np.ndarray,
         fg_rgb = fg[edge_for_color]
         edge_lum = edge_rgb.mean(axis=1)
         fg_lum = fg_rgb.mean(axis=1)
-        color_dist = np.linalg.norm(edge_rgb - fg_rgb, axis=1) / 441.7
+        color_dist = np.linalg.norm(edge_rgb - fg_rgb, axis=1) / RGB_DISTANCE_MAX
         bright = np.clip((edge_lum - fg_lum - 8.0) / 72.0, 0.0, 1.0) * np.clip(color_dist * 2.0, 0.0, 1.0)
         dark = np.clip((fg_lum - edge_lum - 8.0) / 72.0, 0.0, 1.0) * np.clip(color_dist * 2.0, 0.0, 1.0)
         bright_score = float(np.percentile(bright, 90))
@@ -541,66 +560,87 @@ def _guard_against_overcut(original: np.ndarray, refined: np.ndarray,
     return refined, rollback, guard
 
 
+def _mask_crop(mask: np.ndarray, margin: int = 64,
+               full_frame_ratio: float = ROI_FULL_FRAME_RATIO) -> Optional[Tuple[int, int, int, int]]:
+    """Return a padded crop around mask, or None when cropping brings little benefit."""
+    ys, xs = np.where(mask)
+    if ys.size == 0:
+        return None
+    h, w = mask.shape
+    y1 = max(0, int(ys.min()) - margin)
+    y2 = min(h, int(ys.max()) + 1 + margin)
+    x1 = max(0, int(xs.min()) - margin)
+    x2 = min(w, int(xs.max()) + 1 + margin)
+    if (y2 - y1) * (x2 - x1) >= full_frame_ratio * h * w:
+        return None
+    return y1, y2, x1, x2
+
+
 def _defringe_rgb(image: np.ndarray, alpha: np.ndarray, ctx: Dict[str, np.ndarray],
                   profile: MatteProfile) -> Tuple[np.ndarray, np.ndarray]:
-    """Replace contaminated fringe RGB using matting-aware foreground recovery."""
-    guide_edge = ctx.get("defringe_fringe", ctx["color_fringe"])
-    base = 0.54
-    if profile.defringe in ("bright_edge", "dark_edge"):
-        base += 0.26
-    if profile.profile == "hard_object":
-        base += 0.12
-    if profile.profile in ("detail_safe", "transparent_safe"):
-        base -= 0.14
+    """Remove background-colored RGB residue using local foreground/background colors."""
+    ctx["compute_spill_score"] = _compute_spill_score
+    try:
+        rgb, strength, metrics = background_direction_defringe(image, alpha, ctx, profile)
+    finally:
+        ctx.pop("compute_spill_score", None)
+    ctx["defringe_metrics"] = metrics
+    ctx["bg_confidence"] = metrics.get("bg_confidence_map", np.zeros(alpha.shape, dtype=np.float32))
+    ctx["despill_projection"] = metrics.get("projection_map", np.zeros(alpha.shape, dtype=np.float32))
+    ctx["screen_despill_strength"] = metrics.get("screen_strength_map", np.zeros(alpha.shape, dtype=np.float32))
+    return rgb, strength
 
-    edge = guide_edge & (alpha > 0) & (~ctx["protected_transparency"])
-    strength = np.zeros(alpha.shape, dtype=np.float32)
-    strength_flat = strength.ravel()
-    out = image.copy()
-    if np.any(edge):
-        edge_flat = np.flatnonzero(edge.ravel())
-        image_flat = image.reshape(-1, 3)
-        fg_flat = ctx["foreground_fill"].reshape(-1, 3)
-        bg_flat = ctx["background_fill"].reshape(-1, 3)
 
-        rgb_edge = image_flat[edge_flat].astype(np.float32)
-        fg_edge = fg_flat[edge_flat].astype(np.float32)
-        color_dist = np.linalg.norm(rgb_edge - fg_edge, axis=1) / 255.0
-        spill_edge = ctx["spill_score"].ravel()[edge_flat]
-        contamination_edge = np.maximum(np.clip(color_dist / 0.48, 0.0, 1.0), spill_edge)
-        strength_edge = np.clip(base * contamination_edge, 0.0, 0.94).astype(np.float32)
-        strength_edge[ctx["detail"].ravel()[edge_flat]] *= 0.40
-        strength_flat[edge_flat] = strength_edge
+def _rgb_residue_summary(rgb: np.ndarray, alpha: np.ndarray,
+                         ctx: Dict[str, np.ndarray],
+                         with_map: bool = False) -> Dict[str, object]:
+    """Estimate visible background-colored RGB that remains on matte edges."""
+    eval_mask = ctx["color_fringe"] & (alpha > 0)
+    count = int(np.sum(eval_mask))
+    residue_map = np.zeros(alpha.shape, dtype=np.float32)
+    if count == 0:
+        summary = {
+            "pixels": 0,
+            "spill_mean": 0.0,
+            "spill_p95": 0.0,
+            "visible_mean": 0.0,
+            "visible_p95": 0.0,
+        }
+        if with_map:
+            summary["visible_map"] = residue_map
+        return summary
 
-        active = strength_edge > 0
-        if np.any(active):
-            active_flat = edge_flat[active]
-            out_flat = out.reshape(-1, 3)
-            rgb = image_flat[active_flat].astype(np.float32)
-            fg = fg_flat[active_flat].astype(np.float32)
-            bg = bg_flat[active_flat].astype(np.float32)
-            a = alpha.ravel()[active_flat].astype(np.float32)
-            guide_alpha = ctx.get("defringe_alpha", alpha).ravel()[active_flat].astype(np.float32)
-            solve_alpha = np.minimum(a, np.maximum(guide_alpha, 1.0))
-            af = np.clip(solve_alpha / 255.0, 0.06, 1.0)[:, None]
-            unpremultiplied = np.clip((rgb - bg * (1.0 - af)) / af, 0.0, 255.0)
-            hard_bonus = 0.38 if profile.profile == "hard_object" else 0.0
-            fg_anchor = np.clip(
-                spill_edge[active] * 0.82 + (1.0 - af[:, 0]) * 0.36
-                + hard_bonus * contamination_edge[active],
-                0.0,
-                0.96 if profile.profile == "hard_object" else 0.75,
-            )[:, None]
-            target = unpremultiplied * (1.0 - fg_anchor) + fg * fg_anchor
-            strength_active = strength_edge[active][:, None]
-            out_flat[active_flat] = np.clip(
-                rgb * (1.0 - strength_active) + target * strength_active,
-                0,
-                255,
-            ).astype(np.uint8)
+    spill_score, fg_dist, bg_dist = _compute_spill_score(
+        rgb,
+        ctx["foreground_fill"],
+        ctx["background_fill"],
+        mask=eval_mask,
+    )
+    spill_vals = spill_score[eval_mask]
+    alpha_weight = alpha[eval_mask].astype(np.float32) / 255.0
+    visible_vals = spill_vals * alpha_weight
+    residue_map[eval_mask] = visible_vals
 
-    out[alpha == 0] = 0
-    return out, strength
+    summary = {
+        "pixels": count,
+        "spill_mean": float(spill_vals.mean()),
+        "spill_p95": float(np.percentile(spill_vals, 95)),
+        "visible_mean": float(visible_vals.mean()),
+        "visible_p95": float(np.percentile(visible_vals, 95)),
+    }
+    if with_map:
+        summary["visible_map"] = residue_map
+    return summary
+
+
+def _rgb_residue_diagnostics(image: np.ndarray, rgb: np.ndarray,
+                             alpha: np.ndarray, ctx: Dict[str, np.ndarray],
+                             with_map: bool = False) -> Dict[str, Dict[str, object]]:
+    before = _rgb_residue_summary(image, alpha, ctx, with_map=with_map)
+    after = _rgb_residue_summary(rgb, alpha, ctx, with_map=with_map)
+    base = max(float(before["visible_mean"]), 1e-6)
+    after["visible_improve"] = float((before["visible_mean"] - after["visible_mean"]) / base)
+    return {"before": before, "after": after}
 
 
 def _edge_width(ctx: Dict[str, np.ndarray]) -> Tuple[float, float]:
@@ -612,10 +652,13 @@ def _edge_width(ctx: Dict[str, np.ndarray]) -> Tuple[float, float]:
 
 def _dump_stats(profile: MatteProfile, width: Tuple[float, float],
                 guard: Dict[str, float], rollback: bool,
-                strength: np.ndarray, ctx: Dict[str, np.ndarray]) -> None:
+                strength: np.ndarray, ctx: Dict[str, np.ndarray],
+                rgb_residue: Optional[Dict[str, Dict[str, object]]] = None) -> None:
+    metrics = ctx.get("defringe_metrics", {})
     active = strength[strength > 0]
     strength_mean = float(active.mean()) if active.size else 0.0
     strength_p95 = float(np.percentile(active, 95)) if active.size else 0.0
+    active_pixels = int(np.sum(strength > 0))
     defringe_soft = int(np.sum((strength > 0) & ctx["fringe"]))
     defringe_opaque = int(np.sum((strength > 0) & ctx["opaque_rim"]))
     defringe_solid = int(np.sum((strength > 0) & ctx["solid_rim"]))
@@ -633,7 +676,36 @@ def _dump_stats(profile: MatteProfile, width: Tuple[float, float],
     print(
         "[后处理诊断] 边色污染: "
         f"bright={profile.bright_fringe_score:.2f} dark={profile.dark_fringe_score:.2f} "
-        f"defringe={profile.defringe} strength_mean={strength_mean:.3f} strength_p95={strength_p95:.3f}"
+        f"edge_bias={profile.defringe} strength_mean={strength_mean:.3f} strength_p95={strength_p95:.3f}"
+    )
+    print(
+        "[postprocess diag] RGB recovery: "
+        f"method={metrics.get('method', 'background_direction_despill')} replace=background_direction "
+        f"scope=edge-only applied={active_pixels}px "
+        f"soft={metrics.get('soft_pixels', 0)}px "
+        f"high_alpha={metrics.get('high_alpha_pixels', 0)}px "
+        f"opaque={metrics.get('opaque_pixels', 0)}px "
+        f"screen={metrics.get('screen_pixels', 0)}px "
+        f"skip_bg={metrics.get('skipped_low_bg_conf', 0)}px "
+        f"skip_amb={metrics.get('skipped_ambiguous', 0)}px "
+        f"skip_proj={metrics.get('skipped_projection', 0)}px "
+        f"skip_protect={metrics.get('skipped_protected', 0)}px"
+    )
+    print(
+        "[postprocess diag] BG confidence: "
+        f"seed={metrics.get('bg_seed_pixels', profile.bg_color_seed_pixels)}px "
+        f"near_edge={metrics.get('bg_seed_near_edge', 0.0) * 100.0:.2f}% "
+        f"conf={metrics.get('bg_conf_mean', 0.0):.3f}/"
+        f"{metrics.get('bg_conf_p10', 0.0):.3f}(mean/p10) "
+        f"var_p95={metrics.get('bg_var_p95', 0.0):.3f} "
+        f"fill_err_p95={metrics.get('bg_fill_error_p95', 0.0):.3f}"
+    )
+    print(
+        "[postprocess diag] Screen despill: "
+        f"green={metrics.get('screen_green_pixels', 0)}px "
+        f"blue={metrics.get('screen_blue_pixels', 0)}px "
+        f"strength={metrics.get('screen_strength_mean', 0.0):.3f}/"
+        f"{metrics.get('screen_strength_p95', 0.0):.3f}(mean/p95)"
     )
     print(
         "[postprocess diag] Color model: "
@@ -645,8 +717,29 @@ def _dump_stats(profile: MatteProfile, width: Tuple[float, float],
     print(
         "[postprocess diag] Defringe coverage: "
         f"soft={defringe_soft}px opaque={defringe_opaque}px solid={defringe_solid}px "
-        f"total={int(np.sum(strength > 0))}px"
+        f"total={active_pixels}px"
     )
+    if rgb_residue is not None:
+        before = rgb_residue["before"]
+        after = rgb_residue["after"]
+        print(
+            "[postprocess diag] RGB residue(final-alpha): "
+            f"pixels={after['pixels']} "
+            f"before_spill={before['spill_mean']:.3f}/{before['spill_p95']:.3f} "
+            f"after_spill={after['spill_mean']:.3f}/{after['spill_p95']:.3f} "
+            f"visible={before['visible_mean']:.3f}->{after['visible_mean']:.3f} "
+            f"p95={before['visible_p95']:.3f}->{after['visible_p95']:.3f} "
+            f"improve={pct(after['visible_improve']):.2f}%"
+        )
+        before_bins = metrics.get("residue_before_by_alpha", {})
+        after_bins = metrics.get("residue_after_by_alpha", {})
+        print(
+            "[postprocess diag] RGB residue by alpha: "
+            f"<64={before_bins.get('lt64', 0.0):.3f}->{after_bins.get('lt64', 0.0):.3f} "
+            f"64-180={before_bins.get('64_180', 0.0):.3f}->{after_bins.get('64_180', 0.0):.3f} "
+            f"180-240={before_bins.get('180_240', 0.0):.3f}->{after_bins.get('180_240', 0.0):.3f} "
+            f">=240={before_bins.get('gte240', 0.0):.3f}->{after_bins.get('gte240', 0.0):.3f}"
+        )
     print(
         "[后处理诊断] 保护区域: "
         f"detail={profile.detail_pixels}px({pct(profile.detail_ratio):.2f}%/edge) "
@@ -666,7 +759,7 @@ def _dump_stats(profile: MatteProfile, width: Tuple[float, float],
     )
     print(
         "[后处理诊断] 决策: "
-        f"profile={profile.profile} alpha_tighten={profile.alpha_tighten} defringe={profile.defringe}"
+        f"profile={profile.profile} alpha_tighten={profile.alpha_tighten} edge_bias={profile.defringe}"
     )
 
 
@@ -711,10 +804,41 @@ def _save_debug(debug_dir: str, image: np.ndarray, rgb: np.ndarray,
         np.clip(ctx["background_fill"], 0, 255).astype(np.uint8),
         "RGB",
     ).save(os.path.join(debug_dir, "51_local_bg_fill.png"))
+    if "bg_confidence" in ctx:
+        Image.fromarray(
+            np.clip(ctx["bg_confidence"] * 255, 0, 255).astype(np.uint8),
+            "L",
+        ).save(os.path.join(debug_dir, "56_bg_confidence.png"))
+    if "despill_projection" in ctx:
+        Image.fromarray(
+            np.clip(ctx["despill_projection"] * 255, 0, 255).astype(np.uint8),
+            "L",
+        ).save(os.path.join(debug_dir, "57_despill_projection.png"))
+    if "screen_despill_strength" in ctx:
+        Image.fromarray(
+            np.clip(ctx["screen_despill_strength"] * 255, 0, 255).astype(np.uint8),
+            "L",
+        ).save(os.path.join(debug_dir, "58_screen_despill_strength.png"))
     rgb_delta = np.max(np.abs(rgb.astype(np.int16) - image.astype(np.int16)), axis=2)
     rgb_delta[(alpha_after == 0) | (strength <= 0)] = 0
     Image.fromarray(np.clip(rgb_delta * 4, 0, 255).astype(np.uint8), "L").save(
         os.path.join(debug_dir, "52_rgb_defringe_delta.png")
+    )
+    residue_diag = _rgb_residue_diagnostics(image, rgb, alpha_after, ctx, with_map=True)
+    before_residue = residue_diag["before"]["visible_map"]
+    after_residue = residue_diag["after"]["visible_map"]
+    Image.fromarray(np.clip(before_residue * 255, 0, 255).astype(np.uint8), "L").save(
+        os.path.join(debug_dir, "53_rgb_residue_before.png")
+    )
+    Image.fromarray(np.clip(after_residue * 255, 0, 255).astype(np.uint8), "L").save(
+        os.path.join(debug_dir, "54_rgb_residue_after.png")
+    )
+    residue_delta = before_residue - after_residue
+    residue_delta_rgb = np.zeros((*alpha_after.shape, 3), dtype=np.uint8)
+    residue_delta_rgb[..., 1] = np.clip(residue_delta * 255 * 2, 0, 255).astype(np.uint8)
+    residue_delta_rgb[..., 0] = np.clip(-residue_delta * 255 * 2, 0, 255).astype(np.uint8)
+    Image.fromarray(residue_delta_rgb, "RGB").save(
+        os.path.join(debug_dir, "55_rgb_residue_delta.png")
     )
 
     for name, color in {
@@ -730,22 +854,8 @@ def _save_debug(debug_dir: str, image: np.ndarray, rgb: np.ndarray,
 
 
 def _foreground_crop(alpha: np.ndarray, margin: int = 64) -> Optional[Tuple[int, int, int, int]]:
-    """前景外接框 + margin。纯背景区域恒为透明，无需参与后处理。
-
-    margin (>3σ) 保证颜色填充的背景 seed 与拓扑边界连通性不受裁剪影响；
-    已接近全图时返回 None（裁剪无收益）。
-    """
-    ys, xs = np.where(alpha > 0)
-    if ys.size == 0:
-        return None
-    h, w = alpha.shape
-    y1 = max(0, int(ys.min()) - margin)
-    y2 = min(h, int(ys.max()) + 1 + margin)
-    x1 = max(0, int(xs.min()) - margin)
-    x2 = min(w, int(xs.max()) + 1 + margin)
-    if (y2 - y1) * (x2 - x1) >= 0.92 * h * w:
-        return None
-    return y1, y2, x1, x2
+    """Crop around non-zero alpha; return None when the crop is almost full-frame."""
+    return _mask_crop(alpha > 0, margin=margin)
 
 
 def _clean_rgba_core(image_u8: np.ndarray, alpha_u8: np.ndarray, debug_dir: Optional[str],
@@ -767,7 +877,8 @@ def _clean_rgba_core(image_u8: np.ndarray, alpha_u8: np.ndarray, debug_dir: Opti
     rgb, strength = _defringe_rgb(image_u8, alpha_refined, ctx, profile)
 
     if debug_dir:
-        _dump_stats(profile, width, guard, rollback, strength, ctx)
+        rgb_residue = _rgb_residue_diagnostics(image_u8, rgb, alpha_refined, ctx)
+        _dump_stats(profile, width, guard, rollback, strength, ctx, rgb_residue)
         _save_debug(debug_dir, image_u8, rgb, alpha_u8, alpha_refined, ctx, strength)
     return np.dstack([rgb, alpha_refined])
 

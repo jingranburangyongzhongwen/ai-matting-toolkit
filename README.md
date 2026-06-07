@@ -53,7 +53,7 @@ flowchart TB
   subgraph PP["共用 · RGBA 后处理"]
     direction LR
     PP_IN[RGB + alpha] --> PP_ANA[拓扑分析] --> PP_PROF[自适应 profile]
-    PP_PROF --> PP_TIGHT[收紧光晕带] --> PP_FIX[过切回滚 + 去色边] --> PP_RGBA[RGBA PNG]
+    PP_PROF --> PP_TIGHT[收紧光晕带] --> PP_FIX[过切回滚 + 背景方向去色边] --> PP_RGBA[RGBA PNG]
   end
 
   M1_A --> PP_IN
@@ -74,6 +74,7 @@ flowchart TB
 - 模式一 **ViTMatte 精修**：在 RMBG alpha 上内部生成窄 unknown trimap 再精修；若同时勾选「检测透明物体」，DINO 用于修正 trimap（非直出路径）。
 - 模式一勾选「检测透明物体」且为直出时：仅在后处理阶段加强半透明保护，**不跑 DINO 检测**。
 - 模式二 **不走 ViTMatte**；输出二选一：**SAM严格**（纯 SAM 边界，不调 RMBG）或 **RMBG精修**（ROI 内 RMBG + 约束融合）。低显存下 SAM-HQ 与 RMBG 可能同时驻留，建议 ≥8GB 显存或优先 MobileSAM。
+- 两种模式导出前都会走自动 RGB 去色边：使用 alpha 外侧背景 seed 估计局部背景方向，只在背景可信且边缘确有背景色残留时修正；透明保护区与细节区保持保守。
 - 默认 **单 session 低显存**；多人/多标签页加 `--multi-session`（每页独立 SAM predictor / embedding / 点击先验，SAM 会话 LRU，默认最多 8 个）。
 
 ### 模式一：一键抠图
@@ -123,6 +124,11 @@ flowchart TB
 pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
+RGBA 后处理不依赖额外 matting solver；RGB 去色边基于 OpenCV/Numpy 的局部背景方向抑制。可不加载模型，先验证后处理诊断链路：
+
+```bash
+python scripts/verify_rgb_defringe.py
+```
 ### 运行
 
 ```bash
@@ -240,7 +246,7 @@ A: JPG、PNG、BMP、WEBP、TIFF
 |---|---|---|
 | 自动抠图 | [RMBG-2.0](https://huggingface.co/briaai/RMBG-2.0) | 模式一全图；模式二 ROI alpha |
 | 边缘精修 | [ViTMatte](https://huggingface.co/hustvl/vitmatte-base-distinctions-646) | 仅模式一可选（Small/Base/MatAny） |
-| 输出净化 | `engines/rgba_postprocess` | 两模式共用：拓扑收边、去色边、半透明保护 |
+| 输出净化 | `engines/rgba_postprocess` + `engines/rgb_defringe` | 两模式共用：拓扑收边、背景方向去色边、半透明保护 |
 | 快速选区 | [MobileSAM](https://github.com/ChaoningZhang/MobileSAM) | 模式二交互与先验 |
 | 高精度选区 | [SAM-HQ](https://github.com/SysCV/sam-hq) | 模式二高精度选区 |
 | 文本定位 | [Grounding-DINO](https://huggingface.co/IDEA-Research/grounding-dino-tiny) | 模式二框选；模式一 ViTMatte+透明检测时修正 trimap |
