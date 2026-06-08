@@ -385,39 +385,12 @@ class ViTMatteRefiner:
         refined: np.ndarray,
         accept: np.ndarray,
     ) -> np.ndarray:
-        """Merge ViTMatte output across entire accept region using delta propagation.
-        Step 1: merge in unknown band (standard ViTMatte merge).
-        Step 2: propagate delta to rest of accept via Gaussian blur."""
-        # Step 1: standard merge in unknown band
-        merged_unk = ViTMatteRefiner._merge_refined_unknown(
-            alpha_crop, trimap_crop, refined, conservative=False,
-        )
-
-        # Step 2: compute delta on unknown band, blur it, apply to full accept
+        """Merge ViTMatte output in user-accepted region without foreground clamping."""
         refined_u8 = np.clip(refined * 255.0, 0, 255).astype(np.float32)
         orig = alpha_crop.astype(np.float32)
-        unknown = trimap_crop == 127
-
-        # Delta: how much ViTMatte changed alpha in the unknown band
-        delta = np.zeros_like(orig)
-        delta[unknown] = refined_u8[unknown] - orig[unknown]
-
-        # Blur delta to propagate smoothly across accept region
-        # Kernel size proportional to accept region size
-        accept_px = int(np.sum(accept))
-        ksize = max(15, min(101, int(np.sqrt(accept_px)) // 2))
-        if ksize % 2 == 0:
-            ksize += 1
-        delta_blurred = cv2.GaussianBlur(delta, (ksize, ksize), 0)
-
-        # Apply blurred delta across entire accept region
-        result = orig + delta_blurred * accept.astype(np.float32)
-
-        # Clamp known regions
-        result[trimap_crop == 0] = 0.0
-        fg = trimap_crop == 255
-        result[fg] = np.maximum(result[fg], orig[fg])
-
+        result = orig.copy()
+        # Manual repair marks accept as editable; do not max-clamp known FG here.
+        result[accept] = refined_u8[accept]
         return np.clip(result, 0, 255).astype(np.uint8)
 
     def _refine_crop(self, img_np, trimap, alpha, full_h, full_w,

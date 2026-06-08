@@ -30,6 +30,8 @@ from engines.manual_refine import (
     compute_spatial_gate,
     compute_confidence,
     compute_recon_gate,
+    compute_screen_spill_score,
+    estimate_screen_chroma,
     refine_manual_edge,
 )
 from engines.vitmatte import ViTMatteRefiner
@@ -158,6 +160,16 @@ def get_vitmatte_refiner():
     from model_manager import ModelManager
     mgr = ModelManager()
     return mgr.get_vitmatte("base")
+
+
+class FixedAlphaRefiner:
+    """Small deterministic refiner for logic tests that should not need ViTMatte."""
+
+    def __init__(self, alpha_out):
+        self.alpha_out = alpha_out.astype(np.uint8)
+
+    def refine_with_trimap(self, image, alpha, trimap, accept_mask, mode="full", _debug_dir=None):
+        return np.where(accept_mask, self.alpha_out, alpha).astype(np.uint8)
 
 
 # ── Test Cases ─────────────────────────────────────────────────
@@ -336,6 +348,294 @@ def test_similar_fg_bg_hair(refiner, debug_dir=None):
         "status": diag.get("status", "unknown"),
         "max_rgb": round(float(max_val), 1),
         "passed": max_val < 280,  # no garbage values
+    }
+
+
+def test_additional_pure_color_backgrounds(refiner, debug_dir=None):
+    """Yellow/cyan/magenta/purple/beige pure backgrounds should improve or stay safe."""
+    cases = [
+        ("yellow", (95, 70, 45), (225, 210, 35), 10.0),
+        ("cyan", (140, 90, 60), (25, 200, 220), 10.0),
+        ("magenta", (95, 135, 80), (220, 45, 190), 10.0),
+        ("purple", (130, 95, 55), (125, 60, 220), 5.0),
+        ("beige", (80, 55, 40), (210, 190, 150), -10.0),
+    ]
+    results = {}
+    passed = True
+
+    for name, fg_color, bg_color, min_improve in cases:
+        case_debug = os.path.join(debug_dir, name) if debug_dir else None
+        image, alpha_gt, rmbg_alpha, user_mask = make_synthetic_screen(
+            fg_color=fg_color,
+            bg_color=bg_color,
+            size=384,
+        )
+        rgba_in = np.dstack([image, rmbg_alpha])
+        rgba_out, diag = refine_manual_edge(
+            image, rgba_in, user_mask, refiner, debug_dir=case_debug,
+        )
+
+        ctx = build_context(image, rmbg_alpha)
+        before = residue_by_alpha(image, rmbg_alpha, ctx)
+        after = residue_by_alpha(rgba_out[:, :, :3], rgba_out[:, :, 3], ctx)
+        improve = (before["gte240"] - after["gte240"]) / max(before["gte240"], 1e-6) * 100.0
+        max_rgb = float(np.max(rgba_out[:, :, :3]))
+        solid_loss = float(diag.get("solid_loss_pct", 0.0))
+        case_passed = improve > min_improve and solid_loss < 15.0 and max_rgb < 280.0
+        passed = passed and case_passed
+        results[name] = {
+            "gte240_improve_pct": round(float(improve), 1),
+            "residue_before_gte240": round(float(before["gte240"]), 4),
+            "residue_after_gte240": round(float(after["gte240"]), 4),
+            "solid_loss_pct": round(solid_loss, 2),
+            "max_rgb": round(max_rgb, 1),
+            "passed": case_passed,
+        }
+
+    return {
+        "case": "additional_pure_color_backgrounds",
+        "background_results": results,
+        "passed": passed,
+    }
+
+
+def test_screen_chroma_accepts_non_green_blue(refiner, debug_dir=None):
+    """Chroma projection should flag saturated non-green/blue screen residue."""
+    cases = [
+        ("yellow", (225, 210, 35)),
+        ("cyan", (25, 200, 220)),
+        ("magenta", (220, 45, 190)),
+        ("purple", (125, 60, 220)),
+        ("red", (210, 40, 30)),
+    ]
+    results = {}
+    passed = True
+    for name, bg_color in cases:
+        image, alpha_gt, rmbg_alpha, user_mask = make_synthetic_screen(
+            fg_color=(95, 70, 45),
+            bg_color=bg_color,
+            size=256,
+        )
+        ctx = build_context(image, rmbg_alpha)
+        screen_info = estimate_screen_chroma(image, ctx["bg_color_seed"])
+        screen_spill = compute_screen_spill_score(image, screen_info)
+        accept = build_accept_mask(
+            expand_user_mask(user_mask),
+            rmbg_alpha,
+            ctx["protected_transparency"],
+            ctx["dist_to_background"],
+            image_rgb=image,
+            thin_detail=ctx.get("detail"),
+            spill_score=np.zeros_like(ctx["spill_score"]),
+            screen_spill_score=screen_spill,
+        )
+        accept_pixels = int(np.sum(accept))
+        case_passed = (
+            float(screen_info.get("screen_conf", 0.0)) > 0.2
+            and accept_pixels > 0
+            and float(screen_spill[accept].mean()) > 0.1
+        )
+        passed = passed and case_passed
+        results[name] = {
+            "screen_conf": round(float(screen_info.get("screen_conf", 0.0)), 3),
+            "accept_pixels": accept_pixels,
+            "screen_spill_mean": round(float(screen_spill[accept].mean()) if accept_pixels else 0.0, 3),
+            "passed": case_passed,
+        }
+
+    return {
+        "case": "screen_chroma_accepts_non_green_blue",
+        "background_results": results,
+        "passed": passed,
+    }
+
+
+def test_alpha_write_allowed_inside_accept(refiner, debug_dir=None):
+    """Manual alpha write should survive when the change is contained in accept_mask."""
+    image, alpha_gt, rmbg_alpha, user_mask = make_synthetic_screen(
+        fg_color=(120, 80, 50),
+        bg_color=(30, 220, 60),
+        size=256,
+    )
+    ctx = build_context(image, rmbg_alpha)
+    screen_info = estimate_screen_chroma(image, ctx["bg_color_seed"])
+    screen_spill = compute_screen_spill_score(image, screen_info)
+    accept = build_accept_mask(
+        expand_user_mask(user_mask),
+        rmbg_alpha,
+        ctx["protected_transparency"],
+        ctx["dist_to_background"],
+        image_rgb=image,
+        thin_detail=ctx.get("detail"),
+        spill_score=ctx["spill_score"],
+        screen_spill_score=screen_spill,
+    )
+    if not np.any(accept):
+        return {"case": "alpha_write_allowed_inside_accept", "passed": False, "error": "accept empty"}
+
+    alpha_refined = rmbg_alpha.copy()
+    alpha_refined[accept] = np.minimum(alpha_refined[accept], alpha_gt[accept])
+    rgba_in = np.dstack([image, rmbg_alpha])
+    rgba_out, diag = refine_manual_edge(
+        image,
+        rgba_in,
+        user_mask,
+        FixedAlphaRefiner(alpha_refined),
+        ctx=ctx,
+        debug_dir=debug_dir,
+    )
+
+    alpha_delta_accept = np.abs(rgba_out[:, :, 3].astype(int) - rmbg_alpha.astype(int))[accept]
+    alpha_delta_outside = np.abs(rgba_out[:, :, 3].astype(int) - rmbg_alpha.astype(int))[~accept]
+
+    return {
+        "case": "alpha_write_allowed_inside_accept",
+        "alpha_written": diag.get("alpha_written", False),
+        "rollback_alpha": diag.get("rollback_alpha", True),
+        "accept_alpha_delta_mean": round(float(alpha_delta_accept.mean()), 2),
+        "outside_alpha_delta_mean": round(float(alpha_delta_outside.mean()), 4),
+        "passed": (
+            diag.get("alpha_written", False)
+            and float(alpha_delta_accept.mean()) > 2.0
+            and float(alpha_delta_outside.mean()) < 0.5
+        ),
+    }
+
+
+def test_rgb_regression_rolls_back_rgb_and_alpha(refiner, debug_dir=None):
+    """If RGB residue gets worse, rollback the whole edit to avoid worse output."""
+    image, alpha_gt, rmbg_alpha, user_mask = make_synthetic_screen(
+        fg_color=(120, 80, 50),
+        bg_color=(30, 220, 60),
+        size=256,
+    )
+    ctx = build_context(image, rmbg_alpha)
+    screen_info = estimate_screen_chroma(image, ctx["bg_color_seed"])
+    screen_spill = compute_screen_spill_score(image, screen_info)
+    accept = build_accept_mask(
+        expand_user_mask(user_mask),
+        rmbg_alpha,
+        ctx["protected_transparency"],
+        ctx["dist_to_background"],
+        image_rgb=image,
+        thin_detail=ctx.get("detail"),
+        spill_score=ctx["spill_score"],
+        screen_spill_score=screen_spill,
+    )
+    if not np.any(accept):
+        return {"case": "rgb_regression_rolls_back_rgb_and_alpha", "passed": False, "error": "accept empty"}
+
+    alpha_refined = rmbg_alpha.copy()
+    alpha_refined[accept] = np.minimum(alpha_refined[accept], alpha_gt[accept])
+    rgba_in = np.dstack([image, rmbg_alpha])
+
+    # Poison the unmix background so the screen-direction residue truly gets
+    # worse. High-confidence chroma-key cases should rollback on screen residue,
+    # not on the older fill-distance metric.
+    bad_ctx = dict(ctx)
+    bad_ctx["foreground_fill"] = image.astype(np.float32)
+    bad_ctx["background_fill"] = np.full_like(
+        ctx["background_fill"], (255, 0, 255), dtype=np.float32,
+    )
+
+    rgba_out, diag = refine_manual_edge(
+        image,
+        rgba_in,
+        user_mask,
+        FixedAlphaRefiner(alpha_refined),
+        ctx=bad_ctx,
+        debug_dir=debug_dir,
+    )
+
+    visible_accept = accept & (rgba_out[:, :, 3] >= 2)
+    rgb_delta_accept = np.linalg.norm(
+        rgba_out[:, :, :3].astype(float) - image.astype(float),
+        axis=2,
+    )[visible_accept]
+    alpha_delta_accept = np.abs(rgba_out[:, :, 3].astype(int) - rmbg_alpha.astype(int))[accept]
+
+    return {
+        "case": "rgb_regression_rolls_back_rgb_and_alpha",
+        "rollback_rgb": diag.get("rollback_rgb", False),
+        "rollback_rgb_reason": diag.get("rollback_rgb_reason", ""),
+        "alpha_written": diag.get("alpha_written", False),
+        "alpha_write_allowed": diag.get("alpha_write_allowed", False),
+        "residue_metric": diag.get("residue_metric", ""),
+        "rgb_delta_accept_mean": round(float(rgb_delta_accept.mean()), 3),
+        "alpha_delta_accept_mean": round(float(alpha_delta_accept.mean()), 2),
+        "rejected_rgb_improve_pct": round(float(diag.get("rejected_rgb_improve_pct", 0.0)), 1),
+        "passed": (
+            diag.get("rollback_rgb", False)
+            and not diag.get("alpha_written", True)
+            and diag.get("residue_metric") == "screen"
+            and float(rgb_delta_accept.mean()) < 0.5
+            and float(alpha_delta_accept.mean()) < 0.5
+        ),
+    }
+
+
+def test_fill_metric_regression_does_not_block_screen_improvement(refiner, debug_dir=None):
+    """For pure-color screens, screen-residue improvement should override fill-metric noise."""
+    image, alpha_gt, rmbg_alpha, user_mask = make_synthetic_screen(
+        fg_color=(120, 80, 50),
+        bg_color=(30, 220, 60),
+        size=256,
+    )
+    ctx = build_context(image, rmbg_alpha)
+    screen_info = estimate_screen_chroma(image, ctx["bg_color_seed"])
+    screen_spill = compute_screen_spill_score(image, screen_info)
+    accept = build_accept_mask(
+        expand_user_mask(user_mask),
+        rmbg_alpha,
+        ctx["protected_transparency"],
+        ctx["dist_to_background"],
+        image_rgb=image,
+        thin_detail=ctx.get("detail"),
+        spill_score=ctx["spill_score"],
+        screen_spill_score=screen_spill,
+    )
+    if not np.any(accept):
+        return {
+            "case": "fill_metric_regression_does_not_block_screen_improvement",
+            "passed": False,
+            "error": "accept empty",
+        }
+
+    alpha_refined = rmbg_alpha.copy()
+    alpha_refined[accept] = np.minimum(alpha_refined[accept], alpha_gt[accept])
+    rgba_in = np.dstack([image, rmbg_alpha])
+
+    # This white fill was enough to make the old fill-distance diagnostic reject
+    # a visually useful edit. The screen projection should be the deciding KPI.
+    noisy_diag_ctx = dict(ctx)
+    noisy_diag_ctx["foreground_fill"] = image.astype(np.float32)
+    noisy_diag_ctx["background_fill"] = np.full_like(ctx["background_fill"], 255, dtype=np.float32)
+
+    rgba_out, diag = refine_manual_edge(
+        image,
+        rgba_in,
+        user_mask,
+        FixedAlphaRefiner(alpha_refined),
+        ctx=noisy_diag_ctx,
+        debug_dir=debug_dir,
+    )
+
+    alpha_delta_accept = np.abs(rgba_out[:, :, 3].astype(int) - rmbg_alpha.astype(int))[accept]
+
+    return {
+        "case": "fill_metric_regression_does_not_block_screen_improvement",
+        "rollback_rgb": diag.get("rollback_rgb", False),
+        "alpha_written": diag.get("alpha_written", False),
+        "residue_metric": diag.get("residue_metric", ""),
+        "rgb_improve_pct": round(float(diag.get("rgb_improve_pct", 0.0)), 1),
+        "alpha_delta_accept_mean": round(float(alpha_delta_accept.mean()), 2),
+        "passed": (
+            not diag.get("rollback_rgb", True)
+            and diag.get("alpha_written", False)
+            and diag.get("residue_metric") == "screen"
+            and float(diag.get("rgb_improve_pct", 0.0)) > 20.0
+            and float(alpha_delta_accept.mean()) > 2.0
+        ),
     }
 
 
@@ -554,6 +854,11 @@ ALL_TESTS = [
     test_white_bg_hair,
     test_dark_bg_hair,
     test_similar_fg_bg_hair,
+    test_additional_pure_color_backgrounds,
+    test_screen_chroma_accepts_non_green_blue,
+    test_alpha_write_allowed_inside_accept,
+    test_fill_metric_regression_does_not_block_screen_improvement,
+    test_rgb_regression_rolls_back_rgb_and_alpha,
     test_no_regression_interior,
     test_no_regression_low_alpha,
     test_accept_mask_excludes_interior,

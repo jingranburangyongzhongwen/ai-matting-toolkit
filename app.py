@@ -1177,17 +1177,30 @@ def _sam_guided_rmbg_alpha(image: np.ndarray, sam_mask: np.ndarray,
 def on_generate_cutout(image, engine_mode, output_mode, points_state,
                        labels_state, box_state, preserve_transparency=False,
                        save_debug=False, request: gr.Request = None):
-    """generator，yield (result_img, result_view_btn, result_download_btn, status_text)"""
+    """Generate a Tab 2 cutout and expose it to the shared manual-refine flow."""
+    empty_states = (None, None, None, [], gr.update(visible=False))
+    pending_states = (gr.update(), gr.update(), gr.update(), gr.update(), gr.update(visible=False))
+
     if image is None:
-        yield gr.update(), gr.update(), gr.update(value=None, visible=False), gr.update()
+        yield (
+            gr.update(), gr.update(), gr.update(value=None, visible=False), gr.update(),
+            *empty_states,
+        )
         return
     if not points_state and not _box_state_has_boxes(box_state):
-        yield gr.update(), gr.update(), gr.update(value=None, visible=False), "请先标记区域或用文本定位"
+        yield (
+            gr.update(), gr.update(), gr.update(value=None, visible=False),
+            "Please mark a region or use text locate first.",
+            *empty_states,
+        )
         return
 
     try:
-        # SAM 分割（优先用交互 overlay 缓存的 mask，保证一致）
-        yield gr.update(), gr.update(), gr.update(value=None, visible=False), "SAM 分割中..."
+        yield (
+            gr.update(), gr.update(), gr.update(value=None, visible=False),
+            "SAM segmenting...",
+            *pending_states,
+        )
         ctx = _ensure_sam_ready(image, engine_mode, request=request, retain=True)
         try:
             mask = _predict_tab2_mask(ctx, points_state, labels_state, box_state)
@@ -1198,18 +1211,25 @@ def on_generate_cutout(image, engine_mode, output_mode, points_state,
         quality_notes = []
         roi_box = None
         if mode_key == "rmbg_refine":
-            # Optional soft-alpha path: SAM selects the subject, RMBG may still alter edges.
-            yield gr.update(), gr.update(), gr.update(value=None, visible=False), "RMBG-2.0 ROI 精修中..."
+            yield (
+                gr.update(), gr.update(), gr.update(value=None, visible=False),
+                "RMBG-2.0 ROI refining...",
+                *pending_states,
+            )
             alpha, subject_box, roi_box, quality_notes = _sam_guided_rmbg_alpha(
                 image, mask, points_state, labels_state, box_state
             )
         else:
-            yield gr.update(), gr.update(), gr.update(value=None, visible=False), "SAM 严格选区输出中..."
+            yield (
+                gr.update(), gr.update(), gr.update(value=None, visible=False),
+                "SAM strict cutout exporting...",
+                *pending_states,
+            )
             alpha, subject_box = _sam_strict_alpha(
                 mask, points_state, labels_state, box_state, image.shape
             )
-            quality_notes.append("SAM严格边界")
-        # 保存到 output/
+            quality_notes.append("SAM strict boundary")
+
         output_dir = get_output_path()
         out_path = os.path.join(output_dir, "cutout.png")
         counter = 1
@@ -1232,21 +1252,35 @@ def on_generate_cutout(image, engine_mode, output_mode, points_state,
         sx1, sy1, sx2, sy2 = subject_box
         notes = list(quality_notes)
         if preserve_transparency:
-            notes.append("透明材质保护")
+            notes.append("transparent material protected")
         if save_debug:
-            notes.append(f"诊断目录: {os.path.basename(debug_dir)}")
-        note_text = f"\n质量保护: {'、'.join(sorted(set(notes)))}" if notes else ""
+            notes.append(f"debug dir: {os.path.basename(debug_dir)}")
+        note_text = f"\nQuality: {', '.join(sorted(set(notes)))}" if notes else ""
         roi_text = ""
         if roi_box is not None:
             rx1, ry1, rx2, ry2 = roi_box
-            roi_text = f"，RMBG扩边ROI: [{rx1},{ry1},{rx2},{ry2}]"
-        yield result, gr.update(visible=True), gr.update(value=out_path, visible=True), (
-            f"完成！已保存到 {os.path.basename(out_path)}\n"
-            f"SAM主体框: [{sx1},{sy1},{sx2},{sy2}]{roi_text}"
-            f"{note_text}"
+            roi_text = f" (RMBG ROI: [{rx1},{ry1},{rx2},{ry2}])"
+        yield (
+            result,
+            gr.update(visible=True),
+            gr.update(value=out_path, visible=True),
+            (
+                f"Done: {os.path.basename(out_path)}\n"
+                f"SAM subject box: [{sx1},{sy1},{sx2},{sy2}]{roi_text}"
+                f"{note_text}"
+            ),
+            image,
+            rgba,
+            rgba,
+            [],
+            gr.update(visible=True),
         )
     except Exception as e:
-        yield gr.update(), gr.update(), gr.update(value=None, visible=False), f"生成失败: {e}"
+        yield (
+            gr.update(), gr.update(), gr.update(value=None, visible=False),
+            f"Generate failed: {e}",
+            *empty_states,
+        )
 
 
 def on_clear_points(image, request: gr.Request = None):
@@ -1748,6 +1782,37 @@ def _make_editor_value(rgba):
     return {"background": rgba, "layers": [], "composite": rgba}
 
 
+def _normal_result_title():
+    return ('<div class="section-title">Result Preview '
+            '<span class="badge">Transparent BG</span></div>')
+
+
+def _normal_canvas_result_title():
+    return ('<div class="section-title">Result Preview '
+            '<span class="badge">Selection Result</span></div>')
+
+
+def _clear_manual_refine_updates(normal_title=None):
+    """Return UI/state updates that prevent stale manual-refine state after image changes."""
+    if normal_title is None:
+        normal_title = _normal_result_title()
+    return (
+        None,                      # original_rgb_state
+        None,                      # auto_rgba_state
+        None,                      # current_rgba_state
+        [],                        # edit_history_state
+        gr.update(visible=False),  # enter_refine_btn
+        gr.update(value=None, visible=False),  # auto_result_editor
+        gr.update(visible=False),  # editor_actions
+        gr.update(visible=True),   # preview_actions
+        gr.update(value=normal_title),
+    )
+
+
+def _clear_canvas_manual_refine_updates():
+    return _clear_manual_refine_updates(_normal_canvas_result_title())
+
+
 def on_enter_refine_mode(current_rgba_state):
     """Switch from preview to editor mode."""
     if current_rgba_state is None:
@@ -1767,102 +1832,171 @@ def on_enter_refine_mode(current_rgba_state):
     )
 
 
-def on_exit_refine_mode():
-    """Switch back from editor to preview mode."""
-    title = ('<div class="section-title">效果预览 '
-             '<span class="badge">透明背景</span></div>')
+def on_exit_refine_mode(current_rgba_state):
+    """Switch back from editor to preview mode and show the latest refined result."""
+    has_result = current_rgba_state is not None
     return (
-        gr.update(visible=True),        # auto_result_img
-        gr.update(visible=True),        # preview_actions
-        gr.update(visible=False),       # auto_result_editor
-        gr.update(visible=False),       # editor_actions
-        gr.update(value=title),         # result_title
-        gr.update(visible=True),        # enter_refine_btn
+        gr.update(value=current_rgba_state, visible=True),
+        gr.update(visible=True),
+        gr.update(visible=False),
+        gr.update(visible=False),
+        gr.update(value=_normal_result_title()),
+        gr.update(visible=has_result),
+        gr.update(visible=has_result),
+        gr.update(visible=has_result),
         "",
     )
 
 
+def on_enter_canvas_refine_mode(current_rgba_state):
+    """Switch Tab 2 result preview into the shared edge-refine editor."""
+    if current_rgba_state is None:
+        return [gr.update()] * 6 + ["Please generate a cutout first."]
+    editor_val = _make_editor_value(current_rgba_state)
+    title = ('<div class="section-title">Edge Repair '
+             '<span class="badge">Paint Mask</span> '
+             '<span class="section-hint">Paint contaminated edges, then apply repair</span></div>')
+    return (
+        gr.update(visible=False),
+        gr.update(visible=False),
+        gr.update(value=editor_val, visible=True),
+        gr.update(visible=True),
+        gr.update(value=title),
+        gr.update(visible=False),
+        "Repair mode: paint contaminated edges, then click Apply Repair.",
+    )
+
+
+def on_exit_canvas_refine_mode(current_rgba_state):
+    """Switch Tab 2 back from editor to preview mode."""
+    has_result = current_rgba_state is not None
+    return (
+        gr.update(value=current_rgba_state, visible=True),
+        gr.update(visible=True),
+        gr.update(visible=False),
+        gr.update(visible=False),
+        gr.update(value=_normal_canvas_result_title()),
+        gr.update(visible=has_result),
+        gr.update(visible=has_result),
+        gr.update(visible=has_result),
+        "",
+    )
+
 def on_apply_refine(auto_result_editor, original_rgb_state, current_rgba_state,
-                    edit_history_state, vitmatte_variant):
+                    edit_history_state, vitmatte_variant, save_debug=False):
     """Apply manual edge refinement."""
+    def fail(message):
+        return (
+            auto_result_editor,
+            current_rgba_state,
+            edit_history_state,
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            message,
+        )
+
     user_mask = _extract_user_mask(auto_result_editor)
     if user_mask is None or not np.any(user_mask):
-        return (auto_result_editor, current_rgba_state, edit_history_state,
-                "未检测到涂抹区域，请用红色画笔涂抹")
+        return fail("No painted area detected; paint the contaminated edge first.")
 
     image_rgb = original_rgb_state
-    if image_rgb is None:
-        return (auto_result_editor, current_rgba_state, edit_history_state,
-                "缺少原图数据")
+    if image_rgb is None or current_rgba_state is None:
+        return fail("Missing source image or current result state.")
 
-    # Load ViTMatte
     variant_key = VITMATTE_VARIANTS.get(vitmatte_variant, "none")
     if variant_key == "none":
-        # Default to base for manual refine
         variant_key = "base"
     try:
         refiner = mgr.get_vitmatte(variant_key)
     except Exception as e:
-        return (auto_result_editor, current_rgba_state, edit_history_state,
-                f"ViTMatte 加载失败: {e}")
+        return fail(f"ViTMatte load failed: {e}")
 
     try:
+        output_dir = get_output_path()
+        out_path = os.path.join(output_dir, "refined.png")
+        counter = 1
+        while os.path.exists(out_path):
+            out_path = os.path.join(output_dir, f"refined_{counter}.png")
+            counter += 1
+        debug_dir = os.path.splitext(out_path)[0] + "_debug" if save_debug else None
         rgba_out, diag = refine_manual_edge(
             image_rgb, current_rgba_state, user_mask, refiner,
+            debug_dir=debug_dir,
+            verbose=bool(save_debug or os.environ.get("MANUAL_REFINE_DEBUG")),
         )
     except Exception as e:
-        return (auto_result_editor, current_rgba_state, edit_history_state,
-                f"修复失败: {e}")
+        return fail(f"Refine failed: {e}")
 
-    # Update history (keep last 5)
     history = list(edit_history_state or [])
     history.append(current_rgba_state.copy())
     if len(history) > 5:
         history = history[-5:]
 
-    # Save to output
-    output_dir = get_output_path()
-    out_path = os.path.join(output_dir, "refined.png")
-    counter = 1
-    while os.path.exists(out_path):
-        out_path = os.path.join(output_dir, f"refined_{counter}.png")
-        counter += 1
     Image.fromarray(rgba_out, "RGBA").save(out_path)
 
     editor_val = _make_editor_value(rgba_out)
-    status_parts = []
-    status_parts.append(f"accept:{diag.get('accept_pixels',0)}px")
-    status_parts.append(f"α变化:{diag.get('alpha_delta_mean',0):.1f}")
-    status_parts.append(f"gate:{diag.get('gate_mean',0):.2f} conf:{diag.get('rgb_conf_mean',0):.2f}")
+    status_parts = [
+        f"accept:{diag.get('accept_pixels', 0)}px",
+        f"alpha_delta:{diag.get('alpha_delta_mean', 0):.1f}",
+        f"gate:{diag.get('gate_mean', 0):.2f} conf:{diag.get('rgb_conf_mean', 0):.2f}",
+    ]
     smooth = diag.get('edge_smooth_score', 0)
-    status_parts.append(f"锯齿:{smooth:.2f}({'差' if smooth > 0.6 else '中' if smooth > 0.3 else '好'})")
+    smooth_label = 'bad' if smooth > 0.6 else 'mid' if smooth > 0.3 else 'good'
+    status_parts.append(f"smooth:{smooth:.2f}({smooth_label})")
     if diag.get("residue_after_by_alpha"):
         after = diag["residue_after_by_alpha"]
         before = diag.get("residue_before_by_alpha", {})
-        status_parts.append(f">=240: {before.get('gte240',0):.3f}->{after.get('gte240',0):.3f}")
+        status_parts.append(f">=240: {before.get('gte240', 0):.3f}->{after.get('gte240', 0):.3f}")
     status_parts.append(os.path.basename(out_path))
 
-    return (gr.update(value=editor_val), rgba_out, history, " | ".join(status_parts))
-
+    return (
+        gr.update(value=editor_val),
+        rgba_out,
+        history,
+        gr.update(value=rgba_out, visible=False),
+        gr.update(visible=False),
+        gr.update(value=out_path, visible=False),
+        " | ".join(status_parts),
+    )
 
 def on_undo_refine(edit_history_state, current_rgba_state):
     """Undo last refinement."""
     history = list(edit_history_state or [])
     if not history:
-        return (current_rgba_state, edit_history_state,
-                _make_editor_value(current_rgba_state) if current_rgba_state is not None else gr.update(),
-                "没有可撤销的修复")
+        editor_update = _make_editor_value(current_rgba_state) if current_rgba_state is not None else gr.update()
+        return (
+            current_rgba_state,
+            edit_history_state,
+            editor_update,
+            gr.update(value=current_rgba_state, visible=False) if current_rgba_state is not None else gr.update(visible=False),
+            gr.update(value=None, visible=False),
+            "No refine history to undo.",
+        )
     prev = history.pop()
     editor_val = _make_editor_value(prev)
-    return (prev, history, gr.update(value=editor_val), "已撤销上次修复")
-
+    return (
+        prev,
+        history,
+        gr.update(value=editor_val),
+        gr.update(value=prev, visible=False),
+        gr.update(value=None, visible=False),
+        "Undid last refine.",
+    )
 
 def on_reset_auto(auto_rgba_state):
     """Reset to auto result."""
     if auto_rgba_state is None:
-        return (None, [], gr.update(), "没有自动结果可恢复")
+        return (None, [], gr.update(), gr.update(visible=False), gr.update(value=None, visible=False), "No auto result to restore.")
     editor_val = _make_editor_value(auto_rgba_state)
-    return (auto_rgba_state, [], gr.update(value=editor_val), "已重置到自动结果")
+    return (
+        auto_rgba_state,
+        [],
+        gr.update(value=editor_val),
+        gr.update(value=auto_rgba_state, visible=False),
+        gr.update(value=None, visible=False),
+        "Reset to auto result.",
+    )
 
 
 # ── build_ui() 构建界面 ─────────────────────────────────────────
@@ -1939,11 +2073,11 @@ def build_ui(model_concurrency_limit=2):
                             visible=False,
                             elem_classes=["btn-secondary", "preview-open-btn"],
                         )
-                    auto_swap_btn = gr.Button(
-                        "清空原图区",
-                        visible=False,
-                        elem_classes="btn-secondary",
-                    )
+                        auto_swap_btn = gr.Button(
+                            "清空原图区",
+                            visible=False,
+                            elem_classes="btn-secondary",
+                        )
 
                 # 右栏：效果预览 / 边缘修复（二选一，全尺寸）
                 with gr.Column(scale=4, elem_classes="panel-card"):
@@ -2122,33 +2256,76 @@ def build_ui(model_concurrency_limit=2):
                             visible=False,
                             elem_classes=["btn-secondary", "preview-open-btn"],
                         )
-                    canvas_swap_btn = gr.Button(
-                        "清空原图区",
-                        visible=False,
-                        elem_classes="btn-secondary",
-                    )
+                        canvas_swap_btn = gr.Button(
+                            "清空原图区",
+                            visible=False,
+                            elem_classes="btn-secondary",
+                        )
 
-                # 右栏：效果预览
+                # Right column: result preview / edge repair for Tab 2
                 with gr.Column(scale=4, elem_classes="panel-card"):
-                    gr.Markdown(
-                        '<div class="section-title">效果预览 '
-                        '<span class="badge">选区结果</span></div>'
+                    canvas_result_title = gr.Markdown(
+                        '<div class="section-title">Result Preview '
+                        '<span class="badge">Selection Result</span></div>'
                     )
                     result_img = gr.Image(
-                        label="效果预览",
+                        label="Result Preview",
                         interactive=False,
                         buttons=[],
                         elem_classes="checkerboard",
                     )
-                    with gr.Row(elem_classes="preview-actions"):
+                    canvas_preview_actions = gr.Row(elem_classes="preview-actions", visible=True)
+                    with canvas_preview_actions:
                         result_view_btn = gr.Button(
-                            "查看大图",
+                            "View Large",
                             visible=False,
                             elem_classes=["btn-secondary", "preview-open-btn"],
                         )
                         result_download_btn = gr.DownloadButton(
-                            "下载",
+                            "Download",
                             visible=False,
+                            elem_classes="btn-secondary",
+                        )
+                        canvas_enter_refine_btn = gr.Button(
+                            "Edge Repair",
+                            visible=False,
+                            elem_classes="btn-primary",
+                        )
+                    canvas_result_editor = gr.ImageEditor(
+                        label=None,
+                        image_mode="RGBA",
+                        type="numpy",
+                        height="68vh",
+                        canvas_size=(2048, 2048),
+                        brush=gr.Brush(
+                            default_size=20,
+                            colors=["#ff0000"],
+                            color_mode="fixed",
+                        ),
+                        eraser=gr.Eraser(default_size=20),
+                        layers=True,
+                        transforms=None,
+                        elem_classes=["checkerboard", "refine-editor"],
+                        interactive=True,
+                        show_label=False,
+                        visible=False,
+                    )
+                    canvas_editor_actions = gr.Row(elem_classes="preview-actions", visible=False)
+                    with canvas_editor_actions:
+                        canvas_apply_refine_btn = gr.Button(
+                            "Apply Repair", variant="primary",
+                            elem_classes="btn-primary",
+                        )
+                        canvas_undo_refine_btn = gr.Button(
+                            "Undo",
+                            elem_classes="btn-secondary",
+                        )
+                        canvas_reset_auto_btn = gr.Button(
+                            "Reset",
+                            elem_classes="btn-secondary",
+                        )
+                        canvas_exit_refine_btn = gr.Button(
+                            "Exit Repair",
                             elem_classes="btn-secondary",
                         )
 
@@ -2156,6 +2333,11 @@ def build_ui(model_concurrency_limit=2):
             points_state = gr.State([])
             labels_state = gr.State([])
             box_state = gr.State(None)
+            canvas_original_rgb_state = gr.State(None)
+            canvas_auto_rgba_state = gr.State(None)
+            canvas_current_rgba_state = gr.State(None)
+            canvas_edit_history_state = gr.State([])
+            canvas_refine_variant_state = gr.State("Base")
 
         # ==================== 事件绑定 ====================
 
@@ -2169,11 +2351,29 @@ def build_ui(model_concurrency_limit=2):
             queue=False,
             show_progress="hidden",
         )
+        auto_files.upload(
+            fn=_clear_manual_refine_updates,
+            inputs=[],
+            outputs=[original_rgb_state, auto_rgba_state, current_rgba_state,
+                     edit_history_state, enter_refine_btn, auto_result_editor,
+                     editor_actions, preview_actions, result_title],
+            queue=False,
+            show_progress="hidden",
+        )
         auto_swap_btn.click(
             fn=on_auto_clear_source,
             outputs=[auto_files, auto_input_img, auto_input_view_btn,
                      auto_swap_btn, auto_result_img, auto_result_view_btn,
                      auto_result_download_btn, auto_status],
+            queue=False,
+            show_progress="hidden",
+        )
+        auto_swap_btn.click(
+            fn=_clear_manual_refine_updates,
+            inputs=[],
+            outputs=[original_rgb_state, auto_rgba_state, current_rgba_state,
+                     edit_history_state, enter_refine_btn, auto_result_editor,
+                     editor_actions, preview_actions, result_title],
             queue=False,
             show_progress="hidden",
         )
@@ -2185,14 +2385,17 @@ def build_ui(model_concurrency_limit=2):
             show_progress="hidden",
         )
 
-        # Reset right column to preview mode when starting auto process
+        # Reset right column and manual-refine state when starting auto process
         auto_btn.click(
             fn=lambda: (gr.update(visible=True), gr.update(visible=True),
                         gr.update(visible=False), gr.update(visible=False),
-                        gr.update(value='<div class="section-title">效果预览 <span class="badge">透明背景</span></div>')),
+                        gr.update(value=_normal_result_title()),
+                        None, None, None, [], gr.update(visible=False)),
             inputs=[],
             outputs=[auto_result_img, preview_actions,
-                     auto_result_editor, editor_actions, result_title],
+                     auto_result_editor, editor_actions, result_title,
+                     original_rgb_state, auto_rgba_state, current_rgba_state,
+                     edit_history_state, enter_refine_btn],
             queue=False,
             show_progress="hidden",
         )
@@ -2219,18 +2422,22 @@ def build_ui(model_concurrency_limit=2):
 
         exit_refine_btn.click(
             fn=on_exit_refine_mode,
-            inputs=[],
+            inputs=[current_rgba_state],
             outputs=[auto_result_img, preview_actions,
                      auto_result_editor, editor_actions,
-                     result_title, enter_refine_btn, auto_status],
+                     result_title, enter_refine_btn,
+                     auto_result_view_btn, auto_result_download_btn,
+                     auto_status],
         )
 
         apply_refine_btn.click(
             fn=on_apply_refine,
             inputs=[auto_result_editor, original_rgb_state, current_rgba_state,
-                    edit_history_state, vitmatte_variant],
+                    edit_history_state, vitmatte_variant, save_debug],
             outputs=[auto_result_editor, current_rgba_state,
-                     edit_history_state, auto_status],
+                     edit_history_state, auto_result_img,
+                     auto_result_view_btn, auto_result_download_btn,
+                     auto_status],
             concurrency_limit=model_concurrency_limit,
             concurrency_id="model-gpu",
         )
@@ -2239,14 +2446,16 @@ def build_ui(model_concurrency_limit=2):
             fn=on_undo_refine,
             inputs=[edit_history_state, current_rgba_state],
             outputs=[current_rgba_state, edit_history_state,
-                     auto_result_editor, auto_status],
+                     auto_result_editor, auto_result_img,
+                     auto_result_download_btn, auto_status],
         )
 
         reset_auto_btn.click(
             fn=on_reset_auto,
             inputs=[auto_rgba_state],
             outputs=[current_rgba_state, edit_history_state,
-                     auto_result_editor, auto_status],
+                     auto_result_editor, auto_result_img,
+                     auto_result_download_btn, auto_status],
         )
 
         # --- Tab 2 ---
@@ -2265,6 +2474,17 @@ def build_ui(model_concurrency_limit=2):
             queue=False,
             show_progress="hidden",
         )
+        engine_mode.change(
+            fn=_clear_canvas_manual_refine_updates,
+            inputs=[],
+            outputs=[canvas_original_rgb_state, canvas_auto_rgba_state,
+                     canvas_current_rgba_state, canvas_edit_history_state,
+                     canvas_enter_refine_btn, canvas_result_editor,
+                     canvas_editor_actions, canvas_preview_actions,
+                     canvas_result_title],
+            queue=False,
+            show_progress="hidden",
+        )
 
         canvas_files.upload(
             fn=on_image_upload,
@@ -2273,6 +2493,17 @@ def build_ui(model_concurrency_limit=2):
                      canvas_swap_btn, result_view_btn, result_download_btn,
                      points_state, labels_state, box_state, result_img,
                      cutout_status],
+            queue=False,
+            show_progress="hidden",
+        )
+        canvas_files.upload(
+            fn=_clear_canvas_manual_refine_updates,
+            inputs=[],
+            outputs=[canvas_original_rgb_state, canvas_auto_rgba_state,
+                     canvas_current_rgba_state, canvas_edit_history_state,
+                     canvas_enter_refine_btn, canvas_result_editor,
+                     canvas_editor_actions, canvas_preview_actions,
+                     canvas_result_title],
             queue=False,
             show_progress="hidden",
         )
@@ -2285,6 +2516,17 @@ def build_ui(model_concurrency_limit=2):
             queue=False,
             show_progress="hidden",
         )
+        canvas_swap_btn.click(
+            fn=_clear_canvas_manual_refine_updates,
+            inputs=[],
+            outputs=[canvas_original_rgb_state, canvas_auto_rgba_state,
+                     canvas_current_rgba_state, canvas_edit_history_state,
+                     canvas_enter_refine_btn, canvas_result_editor,
+                     canvas_editor_actions, canvas_preview_actions,
+                     canvas_result_title],
+            queue=False,
+            show_progress="hidden",
+        )
 
         locate_btn.click(
             fn=on_text_locate,
@@ -2293,6 +2535,17 @@ def build_ui(model_concurrency_limit=2):
                      points_state, labels_state, box_state, cutout_status],
             concurrency_limit=model_concurrency_limit,
             concurrency_id="model-gpu",
+        )
+        locate_btn.click(
+            fn=_clear_canvas_manual_refine_updates,
+            inputs=[],
+            outputs=[canvas_original_rgb_state, canvas_auto_rgba_state,
+                     canvas_current_rgba_state, canvas_edit_history_state,
+                     canvas_enter_refine_btn, canvas_result_editor,
+                     canvas_editor_actions, canvas_preview_actions,
+                     canvas_result_title],
+            queue=False,
+            show_progress="hidden",
         )
 
         canvas_img.select(
@@ -2304,6 +2557,17 @@ def build_ui(model_concurrency_limit=2):
             concurrency_limit=model_concurrency_limit,
             concurrency_id="model-gpu",
         )
+        canvas_img.select(
+            fn=_clear_canvas_manual_refine_updates,
+            inputs=[],
+            outputs=[canvas_original_rgb_state, canvas_auto_rgba_state,
+                     canvas_current_rgba_state, canvas_edit_history_state,
+                     canvas_enter_refine_btn, canvas_result_editor,
+                     canvas_editor_actions, canvas_preview_actions,
+                     canvas_result_title],
+            queue=False,
+            show_progress="hidden",
+        )
 
         generate_btn.click(
             fn=clear_result_preview_on_start,
@@ -2313,12 +2577,25 @@ def build_ui(model_concurrency_limit=2):
             show_progress="hidden",
         )
         generate_btn.click(
+            fn=_clear_canvas_manual_refine_updates,
+            inputs=[],
+            outputs=[canvas_original_rgb_state, canvas_auto_rgba_state,
+                     canvas_current_rgba_state, canvas_edit_history_state,
+                     canvas_enter_refine_btn, canvas_result_editor,
+                     canvas_editor_actions, canvas_preview_actions,
+                     canvas_result_title],
+            queue=False,
+            show_progress="hidden",
+        )
+        generate_btn.click(
             fn=on_generate_cutout,
             inputs=[canvas_img, engine_mode, tab2_output_mode,
                     points_state, labels_state, box_state,
                     canvas_preserve_transparency, canvas_save_debug],
             outputs=[result_img, result_view_btn, result_download_btn,
-                     cutout_status],
+                     cutout_status, canvas_original_rgb_state,
+                     canvas_auto_rgba_state, canvas_current_rgba_state,
+                     canvas_edit_history_state, canvas_enter_refine_btn],
             stream_every=0.5,
             concurrency_limit=model_concurrency_limit,
             concurrency_id="model-gpu",
@@ -2331,6 +2608,65 @@ def build_ui(model_concurrency_limit=2):
                      points_state, labels_state, box_state, cutout_status],
             queue=False,
             show_progress="hidden",
+        )
+        clear_btn.click(
+            fn=_clear_canvas_manual_refine_updates,
+            inputs=[],
+            outputs=[canvas_original_rgb_state, canvas_auto_rgba_state,
+                     canvas_current_rgba_state, canvas_edit_history_state,
+                     canvas_enter_refine_btn, canvas_result_editor,
+                     canvas_editor_actions, canvas_preview_actions,
+                     canvas_result_title],
+            queue=False,
+            show_progress="hidden",
+        )
+
+        canvas_enter_refine_btn.click(
+            fn=on_enter_canvas_refine_mode,
+            inputs=[canvas_current_rgba_state],
+            outputs=[result_img, canvas_preview_actions,
+                     canvas_result_editor, canvas_editor_actions,
+                     canvas_result_title, canvas_enter_refine_btn,
+                     cutout_status],
+        )
+
+        canvas_exit_refine_btn.click(
+            fn=on_exit_canvas_refine_mode,
+            inputs=[canvas_current_rgba_state],
+            outputs=[result_img, canvas_preview_actions,
+                     canvas_result_editor, canvas_editor_actions,
+                     canvas_result_title, canvas_enter_refine_btn,
+                     result_view_btn, result_download_btn,
+                     cutout_status],
+        )
+
+        canvas_apply_refine_btn.click(
+            fn=on_apply_refine,
+            inputs=[canvas_result_editor, canvas_original_rgb_state,
+                    canvas_current_rgba_state, canvas_edit_history_state,
+                    canvas_refine_variant_state, canvas_save_debug],
+            outputs=[canvas_result_editor, canvas_current_rgba_state,
+                     canvas_edit_history_state, result_img,
+                     result_view_btn, result_download_btn,
+                     cutout_status],
+            concurrency_limit=model_concurrency_limit,
+            concurrency_id="model-gpu",
+        )
+
+        canvas_undo_refine_btn.click(
+            fn=on_undo_refine,
+            inputs=[canvas_edit_history_state, canvas_current_rgba_state],
+            outputs=[canvas_current_rgba_state, canvas_edit_history_state,
+                     canvas_result_editor, result_img,
+                     result_download_btn, cutout_status],
+        )
+
+        canvas_reset_auto_btn.click(
+            fn=on_reset_auto,
+            inputs=[canvas_auto_rgba_state],
+            outputs=[canvas_current_rgba_state, canvas_edit_history_state,
+                     canvas_result_editor, result_img,
+                     result_download_btn, cutout_status],
         )
 
     return demo
