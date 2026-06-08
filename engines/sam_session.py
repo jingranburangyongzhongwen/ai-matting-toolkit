@@ -14,6 +14,7 @@ class BaseSAMSession:
         log_prefix: str,
         enable_single_point_multimask: bool = False,
         predict_kwargs: dict | None = None,
+        auto_mask_generator_cls=None,
     ):
         self.device = device
         self.model = model
@@ -21,6 +22,7 @@ class BaseSAMSession:
         self.log_prefix = log_prefix
         self.enable_single_point_multimask = enable_single_point_multimask
         self.predict_kwargs = dict(predict_kwargs or {})
+        self.auto_mask_generator_cls = auto_mask_generator_cls
         self._image_set = False
         self._original_size = None
         self._prev_logits = None
@@ -29,12 +31,25 @@ class BaseSAMSession:
 
     def set_image(self, image: np.ndarray):
         self._original_size = image.shape[:2]
+        self._original_image_rgb = image
         self.predictor.set_image(image)
         self._image_set = True
         self._prev_logits = None
         self._prev_npoints = 0
         self._cached_mask = None
         print(f"[{self.log_prefix}] session 图像特征已缓存, 尺寸: {self._original_size}")
+
+    def auto_segment(self, **kwargs) -> list:
+        """自动分割所有主体，返回按面积降序排列的 mask 列表。"""
+        if not self._image_set:
+            raise RuntimeError("请先调用 set_image() 设置图像")
+        if self.auto_mask_generator_cls is None:
+            raise RuntimeError(f"{self.log_prefix} 未配置 auto_mask_generator_cls")
+        generator = self.auto_mask_generator_cls(self.model, **kwargs)
+        masks = generator.generate(self._original_image_rgb)
+        masks.sort(key=lambda m: m["area"], reverse=True)
+        print(f"[{self.log_prefix}] 自动分割完成, 发现 {len(masks)} 个主体")
+        return masks
 
     def predict_mask(self, point_coords: list, point_labels: list, box=None) -> np.ndarray:
         if not self._image_set:
@@ -115,5 +130,6 @@ class BaseSAMSession:
     def cleanup(self):
         self._image_set = False
         self._original_size = None
+        self._original_image_rgb = None
         if self.predictor is not None:
             self.predictor.reset_image()

@@ -7,13 +7,15 @@ from .sam_session import BaseSAMSession
 
 
 class SAMHQSession(BaseSAMSession):
-    def __init__(self, model, predictor_cls, device: str):
+    def __init__(self, model, predictor_cls, device: str, auto_mask_generator_cls=None):
         super().__init__(
             model,
             predictor_cls,
             device,
             log_prefix="SAM-HQ",
+            enable_single_point_multimask=True,
             predict_kwargs={"hq_token_only": False},
+            auto_mask_generator_cls=auto_mask_generator_cls,
         )
 
 
@@ -35,6 +37,8 @@ class SAMHQEngine:
         self.model.to(self.device)
         self.model.eval()
         self._predictor_cls = SamPredictor
+        from segment_anything_hq import SamAutomaticMaskGenerator
+        self._auto_mask_generator_cls = SamAutomaticMaskGenerator
         import torch
         if torch.cuda.is_available():
             allocated = torch.cuda.memory_allocated() / 1024**3
@@ -45,7 +49,10 @@ class SAMHQEngine:
     def create_session(self):
         """创建独立 predictor/embedding 状态，共享只读模型权重。"""
         self._load_model()
-        return SAMHQSession(self.model, self._predictor_cls, self.device)
+        return SAMHQSession(
+            self.model, self._predictor_cls, self.device,
+            auto_mask_generator_cls=self._auto_mask_generator_cls,
+        )
 
     def _find_checkpoint(self) -> str:
         """查找 SAM-HQ 模型文件"""

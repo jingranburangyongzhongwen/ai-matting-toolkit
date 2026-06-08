@@ -75,8 +75,8 @@ _STALE_SAM_ACTIVE = {}
 _MULTI_SESSION_MODE = False
 _MAX_SAM_CONTEXTS = 1
 ENGINE_MODE_MAP = {
-    "快速模式（MobileSAM）": "mobile_sam",
-    "高精度模式（SAM-HQ）": "sam_hq",
+    "快速": "mobile_sam",
+    "高精度": "sam_hq",
 }
 TAB2_OUTPUT_MODES = {
     "SAM严格": "sam_strict",
@@ -534,7 +534,7 @@ def _filter_text_candidate_boxes(boxes, scores, image_shape, max_prompts=8):
     for idx, (box, score) in enumerate(zip(boxes, scores)):
         x1, y1, x2, y2 = [float(v) for v in box]
         clipped = [max(0.0, x1), max(0.0, y1), min(float(w), x2), min(float(h), y2)]
-        if _box_area(clipped) >= 64:
+        if _box_area(clipped) >= 64 and (not has_scores or score >= 0.30):
             candidates.append({"box": clipped, "score": float(score), "idx": idx})
 
     if has_scores:
@@ -760,6 +760,114 @@ def _draw_tab2_overlay(image, mask, points, labels, box_state=None,
     return img
 
 
+_AUTO_SEG_COLORS = [
+    (255, 56, 56), (56, 255, 56), (56, 56, 255), (255, 255, 56),
+    (255, 56, 255), (56, 255, 255), (128, 56, 255), (255, 128, 56),
+    (56, 255, 128), (128, 255, 56), (255, 56, 128), (56, 128, 255),
+]
+
+
+def _draw_auto_segment_overlay(image, masks, selected_idx=None):
+    """绘制自动分割结果：每个 mask 半透明彩色，选中的高亮。"""
+    overlay = image.copy().astype(np.float32)
+    for i, mask_info in enumerate(masks):
+        color = _AUTO_SEG_COLORS[i % len(_AUTO_SEG_COLORS)]
+        opacity = 0.45 if i == selected_idx else 0.2
+        seg = mask_info["segmentation"]
+        for c in range(3):
+            overlay[:, :, c] = np.where(
+                seg,
+                overlay[:, :, c] * (1 - opacity) + color[c] * opacity,
+                overlay[:, :, c],
+            )
+    img = overlay.clip(0, 255).astype(np.uint8)
+    for i, mask_info in enumerate(masks):
+        ys, xs = np.where(mask_info["segmentation"])
+        if len(xs) > 0:
+            cx, cy = int(xs.mean()), int(ys.mean())
+            label = str(i + 1)
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+            cv2.rectangle(img, (cx - tw // 2 - 4, cy - th - 4),
+                          (cx + tw // 2 + 4, cy + 4), (0, 0, 0), -1)
+            cv2.putText(img, label, (cx - tw // 2, cy),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    return img
+
+
+def _find_smallest_mask_at(masks, x, y):
+    """找到包含 (x,y) 的面积最小的 mask，返回索引；未找到返回 None。"""
+    best_idx = None
+    best_area = None
+    for i, mask_info in enumerate(masks):
+        seg = mask_info["segmentation"]
+        if seg[y, x]:
+            area = mask_info["area"]
+            if best_area is None or area < best_area:
+                best_area = area
+                best_idx = i
+    return best_idx
+
+
+def _find_masks_at(masks, x, y):
+    """找到包含 (x,y) 的所有 mask 索引，排除面积超过最小 mask 10 倍的背景 mask。"""
+    hits = []
+    for i, mask_info in enumerate(masks):
+        seg = mask_info["segmentation"]
+        if seg[y, x]:
+            hits.append((mask_info["area"], i))
+    if not hits:
+        return []
+    hits.sort()
+    min_area = hits[0][0]
+    # 排除面积超过最小 mask 10 倍的背景级 mask
+    return [idx for area, idx in hits if area <= min_area * 10]
+
+
+def _merge_auto_masks(masks, indices):
+    """合并多个 auto-mask 的 segmentation，返回 merged bool array。"""
+    if not indices:
+        return None
+    seg_shape = masks[indices[0]]["segmentation"].shape
+    merged = np.zeros(seg_shape, dtype=bool)
+    for idx in indices:
+        merged |= masks[idx]["segmentation"]
+    return merged
+
+
+def _mask_bbox_from_seg(segmentation):
+    """从 bool mask 计算 [x1, y1, x2, y2] bbox。"""
+    ys, xs = np.where(segmentation)
+    if len(xs) == 0:
+        return None
+    return [int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1]
+
+
+def _exclude_object_at_point(sam, x, y, current_mask):
+    """目标级排除：用 SAM 识别负向点所在的整个物体，从 current_mask 中整体减去。"""
+    saved_logits = sam._prev_logits
+    saved_npoints = sam._prev_npoints
+    saved_cached = sam._cached_mask
+    try:
+        # 用负向点作为正向提示，让 SAM 识别该点所在的物体
+        sam._prev_logits = None
+        sam._prev_npoints = 0
+        exclude_mask = sam.predict_mask([[x, y]], [1], box=None)
+        # 整体减去，而非局部模糊
+        return current_mask & ~exclude_mask
+    finally:
+        sam._prev_logits = saved_logits
+        sam._prev_npoints = saved_npoints
+        sam._cached_mask = saved_cached
+
+
+def _apply_object_exclusions(sam, points, labels, mask):
+    """对所有负向点执行目标级排除。"""
+    for pt, label in zip(points, labels):
+        if label == 0 and mask[int(pt[1]), int(pt[0])]:
+            mask = _exclude_object_at_point(sam, pt[0], pt[1], mask)
+    return mask
+
+
 def _unload_unused_for_tab2_sam_hq(keep_grounding_dino=False):
     """SAM-HQ 低显存准备：只释放 Tab 2 后续不会马上用到的模型。"""
     if not _AGGRESSIVE_UNLOAD:
@@ -810,69 +918,133 @@ def on_image_upload(files, request: gr.Request = None):
     """上传后隐藏上传提示，显示画布。"""
     _clear_session_sam_contexts(request)
     if not files:
-        return gr.update(value=None, visible=True), gr.update(value=None, visible=False), \
-            gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), \
-            gr.update(value=None, visible=False), [], [], None, None, "请先上传图片"
+        return (gr.update(value=None, visible=True), gr.update(value=None, visible=False),
+                gr.update(visible=False), gr.update(visible=False), gr.update(visible=False),
+                gr.update(value=None, visible=False), [], [], None, None,
+                [], False, "请先上传图片")
     first = files[0] if isinstance(files, list) else files
     try:
         img = Image.open(first).convert("RGB")
-        return gr.update(visible=False), gr.update(value=np.array(img), visible=True), \
-            gr.update(visible=True), gr.update(visible=True), gr.update(visible=False), \
-            gr.update(value=None, visible=False), [], [], None, None, "图片已上传，点击图片选取区域或用文本定位"
+        return (gr.update(visible=False), gr.update(value=np.array(img), visible=True),
+                gr.update(visible=True), gr.update(visible=True), gr.update(visible=False),
+                gr.update(value=None, visible=False), [], [], None, None,
+                [], False, "图片已上传，点击\"自动分割\"或直接点击图片选取区域")
     except Exception:
-        return gr.update(value=None, visible=True), gr.update(value=None, visible=False), \
-            gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), \
-            gr.update(value=None, visible=False), [], [], None, None, "图片加载失败"
+        return (gr.update(value=None, visible=True), gr.update(value=None, visible=False),
+                gr.update(visible=False), gr.update(visible=False), gr.update(visible=False),
+                gr.update(value=None, visible=False), [], [], None, None,
+                [], False, "图片加载失败")
 
 
 def on_canvas_clear_source(request: gr.Request = None):
     """清空原图区：恢复上传提示，并清空画布、结果和标记。"""
     _clear_session_sam_contexts(request)
-    return gr.update(value=None, visible=True), gr.update(value=None, visible=False), \
-        gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), \
-        gr.update(value=None, visible=False), [], [], None, None, "请先上传图片"
+    return (gr.update(value=None, visible=True), gr.update(value=None, visible=False),
+            gr.update(visible=False), gr.update(visible=False), gr.update(visible=False),
+            gr.update(value=None, visible=False), [], [], None, None,
+            [], False, "请先上传图片")
 
 
-def on_image_click(image, evt: gr.SelectData, mode, engine_mode, text_locate_enabled,
-                   points_state, labels_state, box_state, request: gr.Request = None):
+def on_image_click(image, evt: gr.SelectData, mode, engine_mode,
+                   points_state, labels_state, box_state,
+                   auto_masks_state, auto_select_mode,
+                   request: gr.Request = None):
+    _RET_ERR = (image, gr.update(visible=False), gr.update(value=None, visible=False),
+                points_state, labels_state, box_state, auto_select_mode)
     if image is None:
-        return image, gr.update(visible=False), gr.update(value=None, visible=False), points_state, labels_state, box_state, "请先上传图片"
+        return *_RET_ERR, "请先上传图片"
     try:
         x, y = evt.index[0], evt.index[1]
     except Exception:
-        return image, gr.update(visible=False), gr.update(value=None, visible=False), points_state, labels_state, box_state, "无法获取点击坐标"
+        return *_RET_ERR, "无法获取点击坐标"
 
-    label = 1 if mode == "正向选取（我要）" else 0
+    # ── 自动分割点选模式 ──
+    if auto_select_mode and auto_masks_state:
+        h, w = image.shape[:2]
+        if not (0 <= x < w and 0 <= y < h):
+            return *_RET_ERR, "点击超出图像范围"
+        hit_indices = _find_masks_at(auto_masks_state, x, y)
+        if not hit_indices:
+            overlay = _draw_auto_segment_overlay(image, auto_masks_state)
+            return (overlay, gr.update(visible=False), gr.update(value=None, visible=False),
+                    [], [], None, True, "未命中任何主体，请点击有色区域")
+        merged_seg = _merge_auto_masks(auto_masks_state, hit_indices)
+        bbox = _mask_bbox_from_seg(merged_seg)
+        if bbox is None:
+            return *_RET_ERR, "mask 无效"
+        point, label = [[x, y]], [1]
+        try:
+            ctx = _ensure_sam_ready(image, engine_mode, retain=True, request=request)
+            try:
+                mask = _predict_tab2_mask(ctx, point, label, box_state=[bbox])
+            finally:
+                _release_sam_context(ctx)
+            overlay = _draw_tab2_overlay(image, mask, point, label, [bbox])
+            count = len(hit_indices)
+            tag = f"已合并 {count} 个主体" if count > 1 else f"已选中主体 #{hit_indices[0] + 1}"
+            # box_state=None: 首次用 box 约束，之后由 prev_logits 接管，后续点不受框限制
+            return (overlay, gr.update(visible=True), gr.update(value=None, visible=False),
+                    point, label, None, False, f"{tag}，可继续点击微调")
+        except Exception as e:
+            return *_RET_ERR, f"选中失败: {e}"
+
+    # ── 正常点选模式 ──
+    label_val = 1 if mode == "正向选取（我要）" else 0
     new_points = list(points_state) + [[x, y]]
-    new_labels = list(labels_state) + [label]
+    new_labels = list(labels_state) + [label_val]
 
     try:
         ctx = _ensure_sam_ready(
             image,
             engine_mode,
-            keep_grounding_dino=bool(text_locate_enabled),
+            keep_grounding_dino=True,
             retain=True,
             request=request,
         )
         try:
             mask = _predict_tab2_mask(ctx, new_points, new_labels, box_state)
+            # 负向点：目标级排除 — 仅当点在当前 mask 内才执行
+            if label_val == 0 and mask[y, x]:
+                mask = _exclude_object_at_point(ctx["sam"], x, y, mask)
         finally:
             _release_sam_context(ctx)
         overlay = _draw_tab2_overlay(
             image, mask, new_points, new_labels, box_state
         )
-        tag = "正向" if label == 1 else "负向"
+        tag = "正向" if label_val == 1 else "负向"
         status = f"已添加{tag}标记 ({x}, {y})，共 {len(new_points)} 个点"
-        return overlay, gr.update(visible=True), gr.update(value=None, visible=False), new_points, new_labels, box_state, status
+        return (overlay, gr.update(visible=True), gr.update(value=None, visible=False),
+                new_points, new_labels, box_state, False, status)
     except Exception as e:
-        return image, gr.update(visible=False), gr.update(value=None, visible=False), new_points, new_labels, box_state, f"预测失败: {e}"
+        return (image, gr.update(visible=False), gr.update(value=None, visible=False),
+                new_points, new_labels, box_state, False, f"预测失败: {e}")
+
+
+def on_auto_segment(image, engine_mode, request: gr.Request = None):
+    """运行自动分割，返回 overlay + masks 状态。"""
+    if image is None:
+        return None, [], [], None, [], True, "请先上传图片"
+    try:
+        ctx = _ensure_sam_ready(image, engine_mode, retain=True, request=request)
+        try:
+            masks = ctx["sam"].auto_segment(points_per_side=32)
+        finally:
+            _release_sam_context(ctx)
+        if not masks:
+            return image, [], [], None, [], False, "未检测到主体"
+        overlay = _draw_auto_segment_overlay(image, masks)
+        return overlay, [], [], None, masks, True, f"发现 {len(masks)} 个主体，点击选择"
+    except Exception as e:
+        return image, [], [], None, [], False, f"自动分割失败: {e}"
 
 
 def on_text_locate(image, caption, engine_mode, request: gr.Request = None):
     if image is None:
-        return None, gr.update(visible=False), gr.update(value=None, visible=False), [], [], None, "请先上传图片"
+        return (None, gr.update(visible=False), gr.update(value=None, visible=False),
+                [], [], None, [], False, "请先上传图片")
     if not caption or not caption.strip():
-        return image, gr.update(visible=False), gr.update(value=None, visible=False), [], [], None, "请输入定位描述"
+        return (image, gr.update(visible=False), gr.update(value=None, visible=False),
+                [], [], None, [], False, "请输入定位描述")
 
     try:
         caption_for_dino = caption.strip()
@@ -881,20 +1053,22 @@ def on_text_locate(image, caption, engine_mode, request: gr.Request = None):
         boxes, scores = mgr.grounding_dino.detect(
             image,
             caption=caption_for_dino,
-            box_threshold=0.18,
-            text_threshold=0.18,
-            max_boxes=16,
+            box_threshold=0.30,
+            text_threshold=0.25,
+            max_boxes=8,
             return_scores=True,
         )
         if not boxes:
-            return image, gr.update(visible=False), gr.update(value=None, visible=False), [], [], None, "未找到匹配物体"
+            return (image, gr.update(visible=False), gr.update(value=None, visible=False),
+                    [], [], None, [], False, "未找到匹配物体")
 
         h, w = image.shape[:2]
         boxes, scores, filter_stats = _filter_text_candidate_boxes(
             boxes, scores, image.shape, max_prompts=8
         )
         if not boxes:
-            return image, gr.update(visible=False), gr.update(value=None, visible=False), [], [], None, "候选框过滤后为空，请换个描述"
+            return (image, gr.update(visible=False), gr.update(value=None, visible=False),
+                    [], [], None, [], False, "候选框过滤后为空，请换个描述")
 
         prompt_boxes = []
         for box_raw in boxes:
@@ -936,9 +1110,11 @@ def on_text_locate(image, caption, engine_mode, request: gr.Request = None):
             f"文本定位: '{caption}' → {len(prompt_boxes)} 个候选框 "
             f"score={score_text}{score_note}{filter_text}{cap_text}；可继续加正/负点修正"
         )
-        return overlay, gr.update(visible=True), gr.update(value=None, visible=False), [], [], prompt_boxes, status
+        return (overlay, gr.update(visible=True), gr.update(value=None, visible=False),
+                [], [], prompt_boxes, [], False, status)
     except Exception as e:
-        return image, gr.update(visible=False), gr.update(value=None, visible=False), [], [], None, f"定位失败: {e}"
+        return (image, gr.update(visible=False), gr.update(value=None, visible=False),
+                [], [], None, [], False, f"定位失败: {e}")
 
 
 def _odd_kernel(value, min_value, max_value):
@@ -1190,7 +1366,7 @@ def on_generate_cutout(image, engine_mode, output_mode, points_state,
     if not points_state and not _box_state_has_boxes(box_state):
         yield (
             gr.update(), gr.update(), gr.update(value=None, visible=False),
-            "Please mark a region or use text locate first.",
+            "请先标记区域或使用文本定位",
             *empty_states,
         )
         return
@@ -1198,12 +1374,13 @@ def on_generate_cutout(image, engine_mode, output_mode, points_state,
     try:
         yield (
             gr.update(), gr.update(), gr.update(value=None, visible=False),
-            "SAM segmenting...",
+            "SAM 分割中...",
             *pending_states,
         )
         ctx = _ensure_sam_ready(image, engine_mode, request=request, retain=True)
         try:
             mask = _predict_tab2_mask(ctx, points_state, labels_state, box_state)
+            mask = _apply_object_exclusions(ctx["sam"], points_state, labels_state, mask)
         finally:
             _release_sam_context(ctx)
 
@@ -1213,7 +1390,7 @@ def on_generate_cutout(image, engine_mode, output_mode, points_state,
         if mode_key == "rmbg_refine":
             yield (
                 gr.update(), gr.update(), gr.update(value=None, visible=False),
-                "RMBG-2.0 ROI refining...",
+                "RMBG-2.0 精修中...",
                 *pending_states,
             )
             alpha, subject_box, roi_box, quality_notes = _sam_guided_rmbg_alpha(
@@ -1222,7 +1399,7 @@ def on_generate_cutout(image, engine_mode, output_mode, points_state,
         else:
             yield (
                 gr.update(), gr.update(), gr.update(value=None, visible=False),
-                "SAM strict cutout exporting...",
+                "SAM 严格抠图导出中...",
                 *pending_states,
             )
             alpha, subject_box = _sam_strict_alpha(
@@ -1252,10 +1429,10 @@ def on_generate_cutout(image, engine_mode, output_mode, points_state,
         sx1, sy1, sx2, sy2 = subject_box
         notes = list(quality_notes)
         if preserve_transparency:
-            notes.append("transparent material protected")
+            notes.append("已保护透明材质")
         if save_debug:
-            notes.append(f"debug dir: {os.path.basename(debug_dir)}")
-        note_text = f"\nQuality: {', '.join(sorted(set(notes)))}" if notes else ""
+            notes.append(f"诊断目录: {os.path.basename(debug_dir)}")
+        note_text = f"\n质量: {', '.join(sorted(set(notes)))}" if notes else ""
         roi_text = ""
         if roi_box is not None:
             rx1, ry1, rx2, ry2 = roi_box
@@ -1265,8 +1442,8 @@ def on_generate_cutout(image, engine_mode, output_mode, points_state,
             gr.update(visible=True),
             gr.update(value=out_path, visible=True),
             (
-                f"Done: {os.path.basename(out_path)}\n"
-                f"SAM subject box: [{sx1},{sy1},{sx2},{sy2}]{roi_text}"
+                f"已完成: {os.path.basename(out_path)}\n"
+                f"主体区域: [{sx1},{sy1},{sx2},{sy2}]{roi_text}"
                 f"{note_text}"
             ),
             image,
@@ -1278,24 +1455,28 @@ def on_generate_cutout(image, engine_mode, output_mode, points_state,
     except Exception as e:
         yield (
             gr.update(), gr.update(), gr.update(value=None, visible=False),
-            f"Generate failed: {e}",
+            f"生成失败: {e}",
             *empty_states,
         )
 
 
 def on_clear_points(image, request: gr.Request = None):
     if image is None:
-        return None, gr.update(visible=False), gr.update(value=None, visible=False), [], [], None, "请先上传图片"
+        return (None, gr.update(visible=False), gr.update(value=None, visible=False),
+                [], [], None, [], False, "请先上传图片")
     _reset_session_sam_interaction_state(request)
-    return None, gr.update(visible=False), gr.update(value=None, visible=False), [], [], None, "标记和文本定位已清除"
+    return (None, gr.update(visible=False), gr.update(value=None, visible=False),
+            [], [], None, [], False, "标记和文本定位已清除")
 
 
 def on_engine_mode_change(image, request: gr.Request = None):
     """切换 SAM 引擎后清空旧选区预览，避免新旧引擎结果混淆。"""
     _clear_session_sam_contexts(request)
     if image is None:
-        return None, gr.update(visible=False), gr.update(value=None, visible=False), [], [], None, "请先上传图片"
-    return None, gr.update(visible=False), gr.update(value=None, visible=False), [], [], None, "引擎已切换，请重新标记"
+        return (None, gr.update(visible=False), gr.update(value=None, visible=False),
+                [], [], None, [], False, "请先上传图片")
+    return (None, gr.update(visible=False), gr.update(value=None, visible=False),
+            [], [], None, [], False, "引擎已切换，请重新标记")
 
 
 # ── APP_CSS 样式 ────────────────────────────────────────────────
@@ -1783,13 +1964,13 @@ def _make_editor_value(rgba):
 
 
 def _normal_result_title():
-    return ('<div class="section-title">Result Preview '
-            '<span class="badge">Transparent BG</span></div>')
+    return ('<div class="section-title">效果预览 '
+            '<span class="badge">透明背景</span></div>')
 
 
 def _normal_canvas_result_title():
-    return ('<div class="section-title">Result Preview '
-            '<span class="badge">Selection Result</span></div>')
+    return ('<div class="section-title">选区预览 '
+            '<span class="badge">抠图结果</span></div>')
 
 
 def _clear_manual_refine_updates(normal_title=None):
@@ -1851,11 +2032,11 @@ def on_exit_refine_mode(current_rgba_state):
 def on_enter_canvas_refine_mode(current_rgba_state):
     """Switch Tab 2 result preview into the shared edge-refine editor."""
     if current_rgba_state is None:
-        return [gr.update()] * 6 + ["Please generate a cutout first."]
+        return [gr.update()] * 6 + ["请先生成抠图结果"]
     editor_val = _make_editor_value(current_rgba_state)
-    title = ('<div class="section-title">Edge Repair '
-             '<span class="badge">Paint Mask</span> '
-             '<span class="section-hint">Paint contaminated edges, then apply repair</span></div>')
+    title = ('<div class="section-title">边缘修复 '
+             '<span class="badge">涂抹蒙版</span> '
+             '<span class="section-hint">涂抹污染边缘，然后点击应用修复</span></div>')
     return (
         gr.update(visible=False),
         gr.update(visible=False),
@@ -1863,7 +2044,7 @@ def on_enter_canvas_refine_mode(current_rgba_state):
         gr.update(visible=True),
         gr.update(value=title),
         gr.update(visible=False),
-        "Repair mode: paint contaminated edges, then click Apply Repair.",
+        "修复模式：涂抹污染边缘区域，然后点击应用修复",
     )
 
 
@@ -1898,11 +2079,11 @@ def on_apply_refine(auto_result_editor, original_rgb_state, current_rgba_state,
 
     user_mask = _extract_user_mask(auto_result_editor)
     if user_mask is None or not np.any(user_mask):
-        return fail("No painted area detected; paint the contaminated edge first.")
+        return fail("未检测到涂抹区域，请先涂抹污染边缘")
 
     image_rgb = original_rgb_state
     if image_rgb is None or current_rgba_state is None:
-        return fail("Missing source image or current result state.")
+        return fail("缺少原图或当前结果状态")
 
     variant_key = VITMATTE_VARIANTS.get(vitmatte_variant, "none")
     if variant_key == "none":
@@ -1910,7 +2091,7 @@ def on_apply_refine(auto_result_editor, original_rgb_state, current_rgba_state,
     try:
         refiner = mgr.get_vitmatte(variant_key)
     except Exception as e:
-        return fail(f"ViTMatte load failed: {e}")
+        return fail(f"ViTMatte 加载失败: {e}")
 
     try:
         output_dir = get_output_path()
@@ -1926,7 +2107,7 @@ def on_apply_refine(auto_result_editor, original_rgb_state, current_rgba_state,
             verbose=bool(save_debug or os.environ.get("MANUAL_REFINE_DEBUG")),
         )
     except Exception as e:
-        return fail(f"Refine failed: {e}")
+        return fail(f"修复失败: {e}")
 
     history = list(edit_history_state or [])
     history.append(current_rgba_state.copy())
@@ -2167,15 +2348,9 @@ def build_ui(model_concurrency_limit=2):
                         '<span class="badge">SAM</span></div>'
                     )
 
-                    click_mode = gr.Radio(
-                        choices=["正向选取（我要）", "负向排除（不要）"],
-                        value="正向选取（我要）",
-                        label="点击模式",
-                        elem_classes="segment-control",
-                    )
                     engine_mode = gr.Radio(
                         choices=list(ENGINE_MODE_MAP.keys()),
-                        value="快速模式（MobileSAM）",
+                        value="快速",
                         label="引擎模式",
                         elem_classes="segment-control",
                     )
@@ -2184,11 +2359,6 @@ def build_ui(model_concurrency_limit=2):
                         value="SAM严格",
                         label="输出模式",
                         elem_classes="segment-control",
-                    )
-
-                    use_text_locate = gr.Checkbox(
-                        label="启用文本定位",
-                        value=False,
                     )
                     canvas_preserve_transparency = gr.Checkbox(
                         label="保护透明/半透明材质",
@@ -2199,36 +2369,53 @@ def build_ui(model_concurrency_limit=2):
                         value=False,
                     )
 
-                    # 文本定位 UI（条件显示）
-                    with gr.Group(
-                        visible=False,
-                        elem_classes="text-locate-panel",
-                    ) as text_locate_group:
+                    click_mode = gr.Radio(
+                        choices=["正向选取（我要）", "负向排除（不要）"],
+                        value="正向选取（我要）",
+                        label="点击模式",
+                        elem_classes="segment-control",
+                    )
+
+                    # 文本定位：一行输入 + 按钮
+                    with gr.Row(equal_height=True):
                         text_caption = gr.Textbox(
-                            label="物体描述",
-                            placeholder="例: red car, person, glass bottle",
+                            label=None,
+                            placeholder="文本定位: red car, person",
                             lines=1,
+                            scale=3,
+                            container=False,
+                            elem_classes="text-locate-input",
                         )
                         locate_btn = gr.Button(
-                            "用文本定位",
+                            "定位",
                             variant="primary",
                             elem_classes="btn-primary",
+                            scale=1,
+                            size="sm",
                         )
 
                     cutout_status = gr.Textbox(
                         label="状态",
                         interactive=False,
-                        lines=3,
+                        lines=1,
+                        max_lines=3,
                         elem_classes="status-box",
                     )
+
+                    with gr.Row():
+                        auto_seg_btn = gr.Button(
+                            "自动分割",
+                            variant="secondary",
+                            elem_classes="btn-secondary",
+                        )
+                        clear_btn = gr.Button(
+                            "清除标记",
+                            elem_classes="btn-secondary",
+                        )
                     generate_btn = gr.Button(
                         "开始抠图",
                         variant="primary",
                         elem_classes="btn-primary",
-                    )
-                    clear_btn = gr.Button(
-                        "清除标记",
-                        elem_classes="btn-secondary",
                     )
 
                 # 中栏：原图
@@ -2262,14 +2449,14 @@ def build_ui(model_concurrency_limit=2):
                             elem_classes="btn-secondary",
                         )
 
-                # Right column: result preview / edge repair for Tab 2
+                # 右栏：选区预览 / 边缘修复
                 with gr.Column(scale=4, elem_classes="panel-card"):
                     canvas_result_title = gr.Markdown(
-                        '<div class="section-title">Result Preview '
-                        '<span class="badge">Selection Result</span></div>'
+                        '<div class="section-title">选区预览 '
+                        '<span class="badge">抠图结果</span></div>'
                     )
                     result_img = gr.Image(
-                        label="Result Preview",
+                        label="选区预览",
                         interactive=False,
                         buttons=[],
                         elem_classes="checkerboard",
@@ -2277,17 +2464,17 @@ def build_ui(model_concurrency_limit=2):
                     canvas_preview_actions = gr.Row(elem_classes="preview-actions", visible=True)
                     with canvas_preview_actions:
                         result_view_btn = gr.Button(
-                            "View Large",
+                            "查看大图",
                             visible=False,
                             elem_classes=["btn-secondary", "preview-open-btn"],
                         )
                         result_download_btn = gr.DownloadButton(
-                            "Download",
+                            "下载",
                             visible=False,
                             elem_classes="btn-secondary",
                         )
                         canvas_enter_refine_btn = gr.Button(
-                            "Edge Repair",
+                            "边缘修复",
                             visible=False,
                             elem_classes="btn-primary",
                         )
@@ -2313,19 +2500,19 @@ def build_ui(model_concurrency_limit=2):
                     canvas_editor_actions = gr.Row(elem_classes="preview-actions", visible=False)
                     with canvas_editor_actions:
                         canvas_apply_refine_btn = gr.Button(
-                            "Apply Repair", variant="primary",
+                            "应用修复", variant="primary",
                             elem_classes="btn-primary",
                         )
                         canvas_undo_refine_btn = gr.Button(
-                            "Undo",
+                            "撤销",
                             elem_classes="btn-secondary",
                         )
                         canvas_reset_auto_btn = gr.Button(
-                            "Reset",
+                            "重置",
                             elem_classes="btn-secondary",
                         )
                         canvas_exit_refine_btn = gr.Button(
-                            "Exit Repair",
+                            "退出修复",
                             elem_classes="btn-secondary",
                         )
 
@@ -2333,6 +2520,8 @@ def build_ui(model_concurrency_limit=2):
             points_state = gr.State([])
             labels_state = gr.State([])
             box_state = gr.State(None)
+            auto_masks_state = gr.State([])
+            auto_select_mode = gr.State(False)
             canvas_original_rgb_state = gr.State(None)
             canvas_auto_rgba_state = gr.State(None)
             canvas_current_rgba_state = gr.State(None)
@@ -2459,18 +2648,12 @@ def build_ui(model_concurrency_limit=2):
         )
 
         # --- Tab 2 ---
-        use_text_locate.change(
-            fn=lambda v: gr.update(visible=v),
-            inputs=[use_text_locate],
-            outputs=[text_locate_group],
-            queue=False,
-            show_progress="hidden",
-        )
         engine_mode.change(
             fn=on_engine_mode_change,
             inputs=[canvas_img],
             outputs=[result_img, result_view_btn, result_download_btn,
-                     points_state, labels_state, box_state, cutout_status],
+                     points_state, labels_state, box_state,
+                     auto_masks_state, auto_select_mode, cutout_status],
             queue=False,
             show_progress="hidden",
         )
@@ -2492,7 +2675,7 @@ def build_ui(model_concurrency_limit=2):
             outputs=[canvas_files, canvas_img, canvas_view_btn,
                      canvas_swap_btn, result_view_btn, result_download_btn,
                      points_state, labels_state, box_state, result_img,
-                     cutout_status],
+                     auto_masks_state, auto_select_mode, cutout_status],
             queue=False,
             show_progress="hidden",
         )
@@ -2512,7 +2695,7 @@ def build_ui(model_concurrency_limit=2):
             outputs=[canvas_files, canvas_img, canvas_view_btn,
                      canvas_swap_btn, result_view_btn, result_download_btn,
                      points_state, labels_state, box_state, result_img,
-                     cutout_status],
+                     auto_masks_state, auto_select_mode, cutout_status],
             queue=False,
             show_progress="hidden",
         )
@@ -2532,7 +2715,8 @@ def build_ui(model_concurrency_limit=2):
             fn=on_text_locate,
             inputs=[canvas_img, text_caption, engine_mode],
             outputs=[result_img, result_view_btn, result_download_btn,
-                     points_state, labels_state, box_state, cutout_status],
+                     points_state, labels_state, box_state,
+                     auto_masks_state, auto_select_mode, cutout_status],
             concurrency_limit=model_concurrency_limit,
             concurrency_id="model-gpu",
         )
@@ -2550,10 +2734,12 @@ def build_ui(model_concurrency_limit=2):
 
         canvas_img.select(
             fn=on_image_click,
-            inputs=[canvas_img, click_mode, engine_mode, use_text_locate,
-                    points_state, labels_state, box_state],
+            inputs=[canvas_img, click_mode, engine_mode,
+                    points_state, labels_state, box_state,
+                    auto_masks_state, auto_select_mode],
             outputs=[result_img, result_view_btn, result_download_btn,
-                     points_state, labels_state, box_state, cutout_status],
+                     points_state, labels_state, box_state,
+                     auto_select_mode, cutout_status],
             concurrency_limit=model_concurrency_limit,
             concurrency_id="model-gpu",
         )
@@ -2567,6 +2753,15 @@ def build_ui(model_concurrency_limit=2):
                      canvas_result_title],
             queue=False,
             show_progress="hidden",
+        )
+
+        auto_seg_btn.click(
+            fn=on_auto_segment,
+            inputs=[canvas_img, engine_mode],
+            outputs=[result_img, points_state, labels_state, box_state,
+                     auto_masks_state, auto_select_mode, cutout_status],
+            concurrency_limit=model_concurrency_limit,
+            concurrency_id="model-gpu",
         )
 
         generate_btn.click(
@@ -2605,7 +2800,8 @@ def build_ui(model_concurrency_limit=2):
             fn=on_clear_points,
             inputs=[canvas_img],
             outputs=[result_img, result_view_btn, result_download_btn,
-                     points_state, labels_state, box_state, cutout_status],
+                     points_state, labels_state, box_state,
+                     auto_masks_state, auto_select_mode, cutout_status],
             queue=False,
             show_progress="hidden",
         )
