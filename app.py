@@ -686,6 +686,7 @@ def _predict_tab2_mask(ctx, points, labels, box_state):
         _filter_tab2_box_logits(ctx, boxes, keep_active=True)
         _prune_tab2_free_logits(ctx)
         combined = np.zeros(sam._original_size, dtype=bool)
+        combined_logits = None
         single_box_logits = None
         for box in boxes:
             box_key = _box_cache_key(box)
@@ -702,8 +703,16 @@ def _predict_tab2_mask(ctx, points, labels, box_state):
                 _cache_get_with_prefix(ctx["box_logits"], current_key, prefix_key)
             )
             combined |= sam.predict_mask(box_points, box_labels, box=box)
+            # 合并多框 logits：取 element-wise max，每个框贡献自己区域的置信度
+            if sam._cached_logits is not None:
+                if combined_logits is None:
+                    combined_logits = sam._cached_logits.copy()
+                else:
+                    combined_logits = np.maximum(combined_logits, sam._cached_logits)
             single_box_logits = sam._prev_logits
             ctx["box_logits"][current_key] = single_box_logits
+        if combined_logits is not None:
+            sam._cached_logits = combined_logits
 
         extra_points = [
             pt for pt, label in zip(points, labels)
@@ -847,6 +856,7 @@ def _exclude_object_at_point(sam, x, y, current_mask):
     saved_logits = sam._prev_logits
     saved_npoints = sam._prev_npoints
     saved_cached = sam._cached_mask
+    saved_cached_logits = sam._cached_logits
     try:
         # 用负向点作为正向提示，让 SAM 识别该点所在的物体
         sam._prev_logits = None
@@ -858,6 +868,7 @@ def _exclude_object_at_point(sam, x, y, current_mask):
         sam._prev_logits = saved_logits
         sam._prev_npoints = saved_npoints
         sam._cached_mask = saved_cached
+        sam._cached_logits = saved_cached_logits
 
 
 def _apply_object_exclusions(sam, points, labels, mask):
@@ -1003,9 +1014,9 @@ def on_image_click(image, evt: gr.SelectData, mode, engine_mode,
         )
         try:
             mask = _predict_tab2_mask(ctx, new_points, new_labels, box_state)
-            # 负向点：目标级排除 — 仅当点在当前 mask 内才执行
-            if label_val == 0 and mask[y, x]:
-                mask = _exclude_object_at_point(ctx["sam"], x, y, mask)
+            # 负向点：目标级排除 — 对所有负向点执行，与最终输出一致
+            if label_val == 0:
+                mask = _apply_object_exclusions(ctx["sam"], new_points, new_labels, mask)
         finally:
             _release_sam_context(ctx)
         overlay = _draw_tab2_overlay(
@@ -1268,27 +1279,45 @@ def _make_rgba_result(image: np.ndarray, alpha: np.ndarray, debug_dir: str = Non
 
 
 def _sam_strict_alpha(sam_mask: np.ndarray, points_state, labels_state,
-                      box_state, image_shape):
-    """Use SAM as the final boundary; only add a tiny anti-aliased transition."""
+                      box_state, image_shape, logits=None):
+    """Use SAM as the final boundary; logits 做 soft alpha，fallback 二值化+模糊。"""
     subject_box = _mask_bbox(sam_mask, image_shape, fallback_box=box_state)
     if subject_box is None:
         raise ValueError("SAM 未得到有效主体区域")
 
-    mask_u8 = (sam_mask > 0).astype(np.uint8) * 255
     x1, y1, x2, y2 = subject_box
     base_dim = max(1, min(x2 - x1, y2 - y1))
+    h, w = image_shape[:2]
 
-    # Close tiny SAM holes, then feather only a 1-3 px contour for anti-aliasing.
     close_k = _odd_kernel(base_dim * 0.006, 3, 11)
     close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k, close_k))
-    mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, close_kernel)
 
-    blur_k = _odd_kernel(base_dim * 0.004, 3, 9)
-    blurred = cv2.GaussianBlur(mask_u8.astype(np.float32), (blur_k, blur_k), 0)
+    if logits is not None and logits.shape == sam_mask.shape:
+        # ── logits 路径：sigmoid → 连续 alpha，边缘质量显著提升 ──
+        mask_u8 = (sam_mask > 0).astype(np.uint8) * 255
+        mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, close_kernel)
 
-    alpha = mask_u8.astype(np.float32) / 255.0
-    contour = cv2.morphologyEx(mask_u8, cv2.MORPH_GRADIENT, close_kernel) > 0
-    alpha[contour] = blurred[contour] / 255.0
+        # 内部区域：alpha = 1.0
+        alpha = np.zeros((h, w), dtype=np.float32)
+        alpha[mask_u8 > 0] = 1.0
+
+        # 边缘扩展带：用 logits 的 sigmoid 做平滑过渡
+        expand_k = _odd_kernel(base_dim * 0.012, 3, 21)
+        expand_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (expand_k, expand_k))
+        contour_band = cv2.dilate(mask_u8, expand_kernel) > 0
+        # sigmoid: logits > 0 → alpha > 0.5，边缘自然过渡
+        alpha[contour_band] = 1.0 / (1.0 + np.exp(-logits[contour_band].astype(np.float32)))
+    else:
+        # ── fallback：二值化 + 形态学 + 高斯模糊 ──
+        mask_u8 = (sam_mask > 0).astype(np.uint8) * 255
+        mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, close_kernel)
+
+        blur_k = _odd_kernel(base_dim * 0.004, 3, 9)
+        blurred = cv2.GaussianBlur(mask_u8.astype(np.float32), (blur_k, blur_k), 0)
+
+        alpha = mask_u8.astype(np.float32) / 255.0
+        contour = cv2.morphologyEx(mask_u8, cv2.MORPH_GRADIENT, close_kernel) > 0
+        alpha[contour] = blurred[contour] / 255.0
 
     alpha = _apply_negative_points(alpha, points_state, labels_state, subject_box)
     return (np.clip(alpha, 0.0, 1.0) * 255).round().astype(np.uint8), subject_box
@@ -1381,6 +1410,7 @@ def on_generate_cutout(image, engine_mode, output_mode, points_state,
         try:
             mask = _predict_tab2_mask(ctx, points_state, labels_state, box_state)
             mask = _apply_object_exclusions(ctx["sam"], points_state, labels_state, mask)
+            cached_logits = ctx["sam"]._cached_logits
         finally:
             _release_sam_context(ctx)
 
@@ -1403,7 +1433,8 @@ def on_generate_cutout(image, engine_mode, output_mode, points_state,
                 *pending_states,
             )
             alpha, subject_box = _sam_strict_alpha(
-                mask, points_state, labels_state, box_state, image.shape
+                mask, points_state, labels_state, box_state, image.shape,
+                logits=cached_logits,
             )
             quality_notes.append("SAM strict boundary")
 

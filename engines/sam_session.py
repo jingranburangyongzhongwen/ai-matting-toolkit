@@ -28,6 +28,7 @@ class BaseSAMSession:
         self._prev_logits = None
         self._prev_npoints = 0
         self._cached_mask = None
+        self._cached_logits = None
 
     def set_image(self, image: np.ndarray):
         self._original_size = image.shape[:2]
@@ -37,6 +38,7 @@ class BaseSAMSession:
         self._prev_logits = None
         self._prev_npoints = 0
         self._cached_mask = None
+        self._cached_logits = None
         print(f"[{self.log_prefix}] session 图像特征已缓存, 尺寸: {self._original_size}")
 
     def auto_segment(self, **kwargs) -> list:
@@ -79,12 +81,14 @@ class BaseSAMSession:
             box=box_arr,
             mask_input=mask_input,
             multimask_output=single_pos_multimask,
+            return_logits=True,
             **self.predict_kwargs,
         )
         idx = int(scores.argmax()) if single_pos_multimask else 0
         self._prev_logits = low_res[idx]
         self._prev_npoints = len(point_coords)
-        self._cached_mask = masks[idx]
+        self._cached_logits = masks[idx]  # 原始 logits（float，保留连续置信度）
+        self._cached_mask = masks[idx] > 0  # 二值 mask（向后兼容）
         return self._cached_mask
 
     def _should_use_single_pos_multimask(self, labels, box_arr, using_prev: bool) -> bool:
@@ -131,5 +135,6 @@ class BaseSAMSession:
         self._image_set = False
         self._original_size = None
         self._original_image_rgb = None
+        self._cached_logits = None
         if self.predictor is not None:
             self.predictor.reset_image()
