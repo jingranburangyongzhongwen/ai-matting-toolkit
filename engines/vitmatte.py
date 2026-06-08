@@ -378,6 +378,21 @@ class ViTMatteRefiner:
         merged[fg] = np.maximum(merged[fg], alpha_crop[fg].astype(np.float32))
         return np.clip(merged, 0, 255).astype(np.uint8)
 
+    @staticmethod
+    def _merge_accept_region(
+        alpha_crop: np.ndarray,
+        trimap_crop: np.ndarray,
+        refined: np.ndarray,
+        accept: np.ndarray,
+    ) -> np.ndarray:
+        """Merge ViTMatte output in user-accepted region without foreground clamping."""
+        refined_u8 = np.clip(refined * 255.0, 0, 255).astype(np.float32)
+        orig = alpha_crop.astype(np.float32)
+        result = orig.copy()
+        # Manual repair marks accept as editable; do not max-clamp known FG here.
+        result[accept] = refined_u8[accept]
+        return np.clip(result, 0, 255).astype(np.uint8)
+
     def _refine_crop(self, img_np, trimap, alpha, full_h, full_w,
                      roi_ys, roi_xs, margin_div=50, tag_prefix="crop",
                      conservative: bool = False):
@@ -469,6 +484,81 @@ class ViTMatteRefiner:
 
         refined = outputs.alphas[0, 0].float().cpu().numpy()[:infer_h, :infer_w]
         return np.clip(refined, 0, 1)
+
+    def refine_with_trimap(
+        self,
+        image: np.ndarray,
+        alpha: np.ndarray,
+        trimap: np.ndarray,
+        accept_mask: np.ndarray,
+        mode: str = "full",
+        _debug_dir: str = None,
+    ) -> np.ndarray:
+        """Run ViTMatte on an externally provided trimap, merge only in accept_mask."""
+        with self._infer_lock:
+            return self._refine_with_trimap_locked(
+                image, alpha, trimap, accept_mask, mode=mode, _debug_dir=_debug_dir,
+            )
+
+    def _refine_with_trimap_locked(
+        self, image: np.ndarray, alpha: np.ndarray, trimap: np.ndarray,
+        accept_mask: np.ndarray, mode: str = "full", _debug_dir: str = None,
+    ) -> np.ndarray:
+        self._load_model()
+        self._set_strided(enabled=False)
+
+        if isinstance(image, np.ndarray) and image.ndim == 3 and image.shape[2] == 3:
+            img_np = image
+        else:
+            img_np = np.asarray(Image.fromarray(image).convert("RGB"))
+        full_h, full_w = img_np.shape[:2]
+
+        # ROI crop from accept_mask with 128px padding
+        ys, xs = np.where(accept_mask)
+        if ys.size == 0:
+            return alpha.copy()
+        pad = 128
+        y_start = max(0, int(ys.min()) - pad)
+        y_end = min(full_h, int(ys.max()) + 1 + pad)
+        x_start = max(0, int(xs.min()) - pad)
+        x_end = min(full_w, int(xs.max()) + 1 + pad)
+
+        roi_img = img_np[y_start:y_end, x_start:x_end]
+        roi_tri = trimap[y_start:y_end, x_start:x_end]
+        roi_h, roi_w = roi_img.shape[:2]
+
+        unk_ys, unk_xs = np.where(roi_tri == 127)
+        if unk_ys.size == 0:
+            return alpha.copy()
+
+        refined = self._run_vitmatte(
+            roi_img, roi_tri, roi_h, roi_w,
+            f"manual-refine {roi_w}x{roi_h}", full_w, full_h,
+        )
+
+        # Merge only in accept_mask region, conservative=False (user confirmed area)
+        roi_alpha = alpha[y_start:y_end, x_start:x_end]
+        roi_trimap = trimap[y_start:y_end, x_start:x_end]
+        roi_accept = accept_mask[y_start:y_end, x_start:x_end]
+
+        # Merge ViTMatte output across entire accept_mask (not just unknown band)
+        roi_merged = self._merge_accept_region(
+            roi_alpha, roi_trimap, refined, roi_accept,
+        )
+
+        # Only write back where accept_mask is True
+        result = alpha.copy()
+        result[y_start:y_end, x_start:x_end] = np.where(
+            roi_accept, roi_merged, roi_alpha,
+        )
+
+        if _debug_dir:
+            os.makedirs(_debug_dir, exist_ok=True)
+            Image.fromarray(result, "L").save(
+                os.path.join(_debug_dir, "manual_vitmatte_alpha.png"),
+            )
+
+        return result
 
     @staticmethod
     def _make_trimap(alpha: np.ndarray, soft: bool = False,
