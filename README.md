@@ -8,6 +8,8 @@
 - **一键批量抠图** — 多图拖入，自动识别主体，输出透明 PNG 到 `output/`
 - **文本定位 + 精细选区** — 正负向点选/框选，蒙版实时预览；可选中英文描述自动框物（Grounding-DINO → SAM），支持继续加点修正；MobileSAM（快）/ SAM-HQ（高精）双引擎
 - **多模型融合** — 精细模式可选 SAM 严格边界，或 SAM 定主体 + RMBG 在 ROI 内约束融合（多主体效果会差）；批量模式 RMBG 全图，可选 ViTMatte 精修软边（大部分情况效果不如直出）
+- **涂抹式边缘修复** — 一键抠图 / 精细选区完成后均可进入修复模式：ViTMatte 重估高 alpha 发丝、regularized unmix 去色边；支持绿/蓝/红/黄/青/品红等纯色幕布的 screen chroma 诊断与回滚保护
+- **结果导出** — 两 Tab 预览区均支持「查看大图」与「下载」透明 PNG；修复结果另存为 `output/refined*.png`
 - **显存管理** — 模型按需加载、用完可卸，减轻显卡压力；默认适合单人使用、尽量省显存；多人同时开多个浏览器页时，每人选区分开保存，并限制「同时处理几张」和排队人数，避免显卡一次占满
 
 ## 功能说明
@@ -56,19 +58,23 @@ flowchart TB
     PP_PROF --> PP_TIGHT[收紧光晕带] --> PP_FIX[过切回滚 + 背景方向去色边] --> PP_RGBA[RGBA PNG]
   end
 
-  subgraph MR["可选 · 边缘修复"]
+  subgraph MR["可选 · 边缘修复（Tab1 / Tab2 共用）"]
     direction LR
-    MR_PAINT[用户涂抹色边] --> MR_MASK[accept_mask]
+    MR_PAINT[用户涂抹色边] --> MR_MASK[accept_mask<br/>+ screen spill]
     MR_MASK --> MR_TRIMAP[spill-aware trimap]
     MR_TRIMAP --> MR_VIT[ViTMatte alpha 重估]
     MR_VIT --> MR_UNMIX[regularized unmix]
-    MR_UNMIX --> MR_MERGE[空间羽化 + 置信度合并] --> MR_OUT[修复后 RGBA]
+    MR_UNMIX --> MR_GATE[方向门控 + 残留诊断]
+    MR_GATE --> MR_RB{回滚?}
+    MR_RB -->|否| MR_OUT[修复后 RGBA]
+    MR_RB -->|是| MR_KEEP[保留原 RGB/A]
   end
 
   M1_A --> PP_IN
   M2_A --> PP_IN
   PP_RGBA --> OUT[(output/)]
   PP_RGBA --> MR_PAINT
+  MR_OUT --> OUT
 
   M1_DINO[检测透明物体] -.->|仅 ViTMatte 精修时<br/>修正 trimap| M1_VIT
   M1_DINO -.->|直出时仅后处理保护| PP_ANA
@@ -95,30 +101,36 @@ flowchart TB
 4. （可选）精修模型：默认直出，或 Small / Base / MatAny
 5. （可选）勾选「保存诊断中间结果」
 6. 点击 **开始抠图** → 结果保存到 `output/`（透明 PNG）
-7. 若发丝/边缘有背景色残留，点击 **边缘修复** → 涂抹污染区域 → **应用修复**
+7. 预览区可 **查看大图** / **下载**；若发丝/边缘有背景色残留，点击 **边缘修复** → 涂抹污染区域 → **应用修复**
 
 ### 边缘修复（手动发丝去色边）
 
-当 RMBG 输出的 alpha 在发丝边缘接近实心（alpha≈240-255），但 RGB 仍含背景色（绿幕/蓝幕/红幕残留）时，自动后处理 despill 效果有限。此时可使用**边缘修复**：
+当 alpha 在发丝边缘接近实心（alpha≈240–255），但 RGB 仍含背景色（绿幕/蓝幕/红幕/黄幕等残留）时，自动后处理 despill 效果有限。此时可使用**边缘修复**（**一键抠图**与**精细选区**共用同一套流程）：
 
-1. 一键抠图完成后，右栏出现 **边缘修复** 按钮
-2. 进入修复模式，用红色画笔涂抹可见的色边区域
+1. 抠图完成后，右栏预览区出现 **边缘修复** 按钮
+2. 进入修复模式，用红色画笔涂抹可见的色边区域（支持橡皮擦修正）
 3. 点击 **应用修复** — 系统自动：
-   - 构建 accept_mask（仅修复靠近背景的边缘，保护内部）
-   - 用 ViTMatte 在窄带内重估 alpha
-   - 通过 regularized unmix 恢复前景 RGB（去除背景色污染）
-   - 空间羽化 + 置信度门控，平滑合并
-4. 支持**撤销**（回退一次）/ **重置**（回到自动结果）/ **退出修复**
+   - 从背景 seed 估计 **screen chroma**（色度平面方向，不绑定绿/蓝某一通道）
+   - 构建 accept_mask（结合 spill score 与 screen spill，仅修复靠近背景的边缘，保护内部与透明材质）
+   - 用 ViTMatte 在 accept 区域重估 alpha（整段 unknown trimap，可恢复「假实心」发丝）
+   - regularized unmix 恢复前景 RGB，screen direction gate 确认色边方向确实被压低
+   - 空间羽化 + 置信度门控合并；若 RGB/alpha 残留指标变差则**自动回滚**（高置信纯色幕优先用 screen 残留度量）
+4. 支持 **撤销**（最多 5 步）/ **重置**（回到自动抠图结果）/ **退出修复**
+5. 换图、重新上传或重新抠图时会自动清空修复状态，避免旧蒙版污染新图
+
+**ViTMatte 变体**：Tab1 跟随「精修模型」选项（直出时内部回退为 Base）；Tab2 固定使用 Base。
 
 ```
-用户涂抹 → accept_mask → spill-aware trimap → ViTMatte alpha
-  → regularized unmix → spatial gate + confidence → 安全合并
+用户涂抹 → accept_mask (+ screen spill) → spill-aware trimap → ViTMatte alpha
+  → regularized unmix → direction gate → 残留诊断 → 安全合并 / 回滚
 ```
 
-**本地测试**（无需启动 UI）：
+**本地测试**（无需启动 UI，18 项合成回归，覆盖多纯色幕、回滚保护与羽化稳定性）：
 
 ```bash
 python scripts/test_manual_refine.py
+# 可选：保存每 case 诊断图
+python scripts/test_manual_refine.py --debug-dir output/_test_manual
 ```
 
 ### 直出 vs ViTMatte 精修
@@ -145,6 +157,30 @@ python scripts/test_manual_refine.py
 5. （可选）「保护透明/半透明材质」— 后处理保留物体内部软 alpha
 6. （可选）「保存诊断中间结果」
 7. 点击 **开始抠图** → RGBA 后处理 → 保存到 `output/`
+8. 预览区可 **查看大图** / **下载**；色边残留时同样可进入 **边缘修复**（流程与 Tab1 相同，ViTMatte 固定 Base）
+
+## 项目结构
+
+```
+ai-matting-toolkit/
+├── app.py                 # Gradio Web UI 与业务流程
+├── model_manager.py       # 模型懒加载、设备与路径
+├── engines/
+│   ├── rmbg2.py           # RMBG-2.0 全图 / ROI alpha
+│   ├── vitmatte.py        # ViTMatte 精修与手动修复推理
+│   ├── rgba_postprocess.py# 拓扑感知 RGBA 后处理（两 Tab 共用出口）
+│   ├── rgb_defringe.py    # 背景方向去色边 + screen despill
+│   ├── manual_refine.py   # 涂抹式边缘修复管线
+│   ├── mobile_sam.py      # MobileSAM 交互
+│   ├── sam_hq.py          # SAM-HQ
+│   └── grounding_dino.py  # 文本定位
+├── scripts/
+│   ├── test_manual_refine.py   # 边缘修复回归测试
+│   └── verify_rgb_defringe.py  # RGB 去色边诊断（无需加载模型）
+├── models/                # 权重目录（见下文）
+├── output/                # 导出 PNG 与可选 _debug 诊断
+└── build.bat              # PyInstaller 打包
+```
 
 ## 开发环境
 
@@ -165,11 +201,8 @@ RGBA 后处理不依赖额外 matting solver；RGB 去色边基于 OpenCV/Numpy 
 python scripts/verify_rgb_defringe.py
 ```
 
-边缘修复自动化测试（需 ViTMatte，GPU ~0.5s/case）：
+边缘修复回归测试见上文「边缘修复」一节（需 ViTMatte，GPU 约 0.5s/case）。
 
-```bash
-python scripts/test_manual_refine.py
-```
 ### 运行
 
 ```bash
@@ -205,7 +238,14 @@ MATTING_PRELOAD_RMBG=0 python app.py
 python app.py --multi-session --max-sam-sessions 8 --model-concurrency 2 --queue-size 32
 ```
 
-环境变量 `MATTING_AGGRESSIVE_UNLOAD=1` 可强制单 session 下更积极卸载未用模型（默认单 session 已启用）。
+### 环境变量
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `MATTING_PRELOAD_RMBG` | `1` | 启动时后台预热 RMBG-2.0；设为 `0` 关闭 |
+| `MATTING_AGGRESSIVE_UNLOAD` | 单 session `1` / 多 session `0` | 任务间更积极卸载未用模型以省显存；显式设为 `1` 可强制启用（单 session 默认已开） |
+| `MATTING_STARTUP_LOG` | `1` | 打印分阶段启动耗时；设为 `0` 关闭 |
+| `MANUAL_REFINE_DEBUG` | 未设置 | 设为任意非空值时，边缘修复打印详细诊断（等同勾选诊断保存时的 verbose） |
 
 ### 下载模型
 
@@ -287,8 +327,8 @@ A: JPG、PNG、BMP、WEBP、TIFF
 |---|---|---|
 | 自动抠图 | [RMBG-2.0](https://huggingface.co/briaai/RMBG-2.0) | 模式一全图；模式二 ROI alpha |
 | 边缘精修 | [ViTMatte](https://huggingface.co/hustvl/vitmatte-base-distinctions-646) | 仅模式一可选（Small/Base/MatAny） |
-| 输出净化 | `engines/rgba_postprocess` + `engines/rgb_defringe` | 两模式共用：拓扑收边、背景方向去色边、半透明保护 |
-| 手动修复 | `engines/manual_refine` | 涂抹色边 → ViTMatte alpha 重估 + regularized unmix 去背景色污染 |
+| 输出净化 | `engines/rgba_postprocess` + `engines/rgb_defringe` | 两模式共用：拓扑收边、背景方向去色边、screen despill、半透明保护 |
+| 手动修复 | `engines/manual_refine` | 两 Tab 共用：screen chroma 诊断、ViTMatte alpha 重估、unmix 去色边、残留回滚 |
 | 快速选区 | [MobileSAM](https://github.com/ChaoningZhang/MobileSAM) | 模式二交互与先验 |
 | 高精度选区 | [SAM-HQ](https://github.com/SysCV/sam-hq) | 模式二高精度选区 |
 | 文本定位 | [Grounding-DINO](https://huggingface.co/IDEA-Research/grounding-dino-tiny) | 模式二框选；模式一 ViTMatte+透明检测时修正 trimap |
