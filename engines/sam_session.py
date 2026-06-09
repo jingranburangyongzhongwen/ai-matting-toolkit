@@ -91,6 +91,53 @@ class BaseSAMSession:
         self._cached_mask = masks[idx] > 0  # 二值 mask（向后兼容）
         return self._cached_mask
 
+    def predict_box_batch(self, boxes: list) -> dict:
+        """Batch predict independent box-only prompts using the cached image embedding."""
+        if not self._image_set:
+            raise RuntimeError("请先调用 set_image() 设置图像")
+
+        box_arr = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
+        if box_arr.size == 0:
+            mask = np.zeros(self._original_size, dtype=bool)
+            self._prev_logits = None
+            self._prev_npoints = 0
+            self._cached_logits = None
+            self._cached_mask = mask
+            return {"mask": mask, "logits": None, "low_res": None, "scores": None}
+
+        import torch
+
+        box_torch = torch.as_tensor(box_arr, dtype=torch.float, device=self.predictor.device)
+        box_torch = self.predictor.transform.apply_boxes_torch(
+            box_torch,
+            self._original_size,
+        )
+        masks, scores, low_res = self.predictor.predict_torch(
+            point_coords=None,
+            point_labels=None,
+            boxes=box_torch,
+            mask_input=None,
+            multimask_output=False,
+            return_logits=True,
+            **self.predict_kwargs,
+        )
+        masks_np = masks[:, 0].detach().cpu().numpy()
+        scores_np = scores[:, 0].detach().cpu().numpy()
+        low_res_np = low_res[:, 0].detach().cpu().numpy()
+
+        combined_logits = masks_np[0] if len(masks_np) == 1 else np.max(masks_np, axis=0)
+        combined_mask = combined_logits > 0
+        self._cached_logits = combined_logits
+        self._cached_mask = combined_mask
+        self._prev_logits = low_res_np[0] if len(low_res_np) == 1 else None
+        self._prev_npoints = 0
+        return {
+            "mask": combined_mask,
+            "logits": combined_logits,
+            "low_res": low_res_np,
+            "scores": scores_np,
+        }
+
     def _should_use_single_pos_multimask(self, labels, box_arr, using_prev: bool) -> bool:
         if not self.enable_single_point_multimask:
             return False

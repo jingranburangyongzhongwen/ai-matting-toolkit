@@ -76,11 +76,13 @@ ENGINE_CONFIGS = {
         "class": "MobileSAMEngine",
         "module": "engines.mobile_sam",
         "model_path": "mobile_sam",
+        "model_type": "vit_t",
     },
     "sam_hq": {
         "class": "SAMHQEngine",
         "module": "engines.sam_hq",
         "model_path": "sam_hq",
+        "model_type": "vit_l",
     },
 }
 
@@ -237,6 +239,7 @@ class ModelManager:
         return engine_class(
             model_path=os.path.join(get_models_path(), config["model_path"]),
             device=self.device,
+            model_type=config["model_type"],
         )
 
     def get_sam_engine(self, engine_type: str):
