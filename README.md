@@ -149,8 +149,11 @@ python scripts/test_manual_refine.py --debug-dir output/_test_manual
 ### 模式二：精细选区
 
 1. 打开 **精细选区** 标签页，上传单张图
-2. **正向选取** / **负向排除**；引擎选 MobileSAM 或 SAM-HQ
-3. 打点预览（仅 SAM）；可选 **文本定位**（DINO 框选 → SAM）
+2. 三种方式获取选区（可混用）：
+   - **直接点图** — 正向/负向点选，SAM 实时预览
+   - **文本定位** — 输入描述（如 `goose`），DINO 自动框选 → SAM 分割
+   - **检测** — SAM 自动识别全部候选主体，点选/排除
+3. 继续打点精修直到满意
 4. 选择 **输出模式**：
    - **SAM严格** — SAM 二值硬边界 + 负向点，不调用 RMBG，最快、边界最贴 SAM
    - **RMBG精修** — SAM 定主体，RMBG 在 ROI 内融合 alpha（默认推荐，高质量路径）
@@ -163,8 +166,14 @@ python scripts/test_manual_refine.py --debug-dir output/_test_manual
 
 ```
 ai-matting-toolkit/
-├── app.py                 # Gradio Web UI 与业务流程
+├── app.py                 # 入口：初始化、Tab1 回调、UI 构建、CLI
 ├── model_manager.py       # 模型懒加载、设备与路径
+├── app_logic/
+│   ├── tab2.py            # Tab2 全部后端：SAM 会话、box 几何、预测、overlay、alpha 生成、回调
+│   └── refine.py          # 手动边缘修复回调（Tab1 / Tab2 共用）
+├── app_ui/
+│   ├── layout.py          # CSS / JS + Gradio 组件布局
+│   └── events.py          # Tab1 / Tab2 事件绑定
 ├── engines/
 │   ├── rmbg2.py           # RMBG-2.0 全图 / ROI alpha
 │   ├── vitmatte.py        # ViTMatte 精修与手动修复推理
