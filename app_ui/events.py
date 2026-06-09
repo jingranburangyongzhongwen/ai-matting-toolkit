@@ -10,8 +10,43 @@ from app_logic.refine import (
 
 def bind_tab1_events(demo, c, model_concurrency_limit, callbacks):
     """绑定 Tab 1 所有事件。c = tab1 components dict。callbacks = tab1 回调 dict。"""
-    c["auto_files"].upload(
+    # 上传模式切换
+    c["upload_mode"].change(
+        fn=callbacks["on_upload_mode_change"],
+        inputs=[c["upload_mode"]],
+        outputs=[c["auto_single_img"], c["auto_files"]],
+        queue=False, show_progress="hidden",
+    )
+
+    # 单张上传/粘贴
+    c["auto_single_img"].change(
         fn=callbacks["on_auto_upload"],
+        inputs=[c["auto_single_img"]],
+        outputs=[c["auto_single_img"], c["auto_input_img"], c["auto_input_view_btn"],
+                 c["auto_swap_btn"], c["auto_result_img"], c["auto_result_view_btn"],
+                 c["auto_result_download_btn"], c["auto_status"]],
+        queue=False, show_progress="hidden",
+    )
+    c["auto_single_img"].change(
+        fn=_clear_manual_refine_updates,
+        inputs=[],
+        outputs=[c["original_rgb_state"], c["auto_rgba_state"], c["current_rgba_state"],
+                 c["edit_history_state"], c["enter_refine_btn"], c["auto_result_editor"],
+                 c["editor_actions"], c["preview_actions"], c["result_title"]],
+        queue=False, show_progress="hidden",
+    )
+
+    # 粘贴解码 → 写入 Image 组件（触发上面的 change 事件）
+    c["paste_box"].change(
+        fn=tab2.on_paste_decode,
+        inputs=[c["paste_box"]],
+        outputs=[c["auto_single_img"]],
+        queue=False, show_progress="hidden",
+    )
+
+    # 批量上传
+    c["auto_files"].upload(
+        fn=callbacks["on_auto_upload_from_file"],
         inputs=[c["auto_files"]],
         outputs=[c["auto_files"], c["auto_input_img"], c["auto_input_view_btn"],
                  c["auto_swap_btn"], c["auto_result_img"], c["auto_result_view_btn"],
@@ -26,9 +61,11 @@ def bind_tab1_events(demo, c, model_concurrency_limit, callbacks):
                  c["editor_actions"], c["preview_actions"], c["result_title"]],
         queue=False, show_progress="hidden",
     )
+
+    # 清空原图
     c["auto_swap_btn"].click(
         fn=callbacks["on_auto_clear_source"],
-        outputs=[c["auto_files"], c["auto_input_img"], c["auto_input_view_btn"],
+        outputs=[c["auto_files"], c["auto_single_img"], c["auto_input_img"], c["auto_input_view_btn"],
                  c["auto_swap_btn"], c["auto_result_img"], c["auto_result_view_btn"],
                  c["auto_result_download_btn"], c["auto_status"]],
         queue=False, show_progress="hidden",
@@ -63,7 +100,7 @@ def bind_tab1_events(demo, c, model_concurrency_limit, callbacks):
     )
     c["auto_btn"].click(
         fn=callbacks["on_auto_process"],
-        inputs=[c["auto_files"], c["auto_input_img"], c["detect_transparent"],
+        inputs=[c["auto_files"], c["auto_single_img"], c["auto_input_img"], c["detect_transparent"],
                 c["vitmatte_variant"], c["process_mode"], c["save_debug"]],
         outputs=[c["auto_input_img"], c["auto_status"], c["auto_result_img"],
                  c["auto_result_view_btn"], c["auto_result_download_btn"],
@@ -140,7 +177,7 @@ def bind_tab2_events(demo, c, model_concurrency_limit):
         queue=False, show_progress="hidden",
     )
 
-    c["canvas_files"].upload(
+    c["canvas_files"].change(
         fn=tab2.on_image_upload,
         inputs=[c["canvas_files"]],
         outputs=[c["canvas_files"], c["canvas_img"], c["canvas_view_btn"],
@@ -150,7 +187,7 @@ def bind_tab2_events(demo, c, model_concurrency_limit):
                  c["text_caption"], c["cutout_status"]],
         queue=False, show_progress="hidden",
     )
-    c["canvas_files"].upload(
+    c["canvas_files"].change(
         fn=_clear_canvas_manual_refine_updates,
         inputs=[],
         outputs=[c["canvas_original_rgb_state"], c["canvas_auto_rgba_state"],
@@ -158,6 +195,13 @@ def bind_tab2_events(demo, c, model_concurrency_limit):
                  c["canvas_enter_refine_btn"], c["canvas_result_editor"],
                  c["canvas_editor_actions"], c["canvas_preview_actions"],
                  c["canvas_result_title"]],
+        queue=False, show_progress="hidden",
+    )
+    # 粘贴解码 → 写入 Image 组件（触发上面的 change 事件）
+    c["paste_box"].change(
+        fn=tab2.on_paste_decode,
+        inputs=[c["paste_box"]],
+        outputs=[c["canvas_files"]],
         queue=False, show_progress="hidden",
     )
     c["canvas_swap_btn"].click(
@@ -263,6 +307,27 @@ def bind_tab2_events(demo, c, model_concurrency_limit):
         stream_every=0.5,
         concurrency_limit=model_concurrency_limit,
         concurrency_id="model-gpu",
+    )
+
+    c["undo_btn"].click(
+        fn=tab2.on_undo_point,
+        inputs=[c["canvas_img"], c["points_state"], c["labels_state"], c["box_state"],
+                c["auto_masks_state"], c["auto_choice_state"], c["engine_mode"]],
+        outputs=[c["result_img"], c["result_view_btn"], c["result_download_btn"],
+                 c["points_state"], c["labels_state"], c["box_state"],
+                 c["auto_choice_state"], c["cutout_status"]],
+        concurrency_limit=model_concurrency_limit,
+        concurrency_id="model-gpu",
+    )
+    c["undo_btn"].click(
+        fn=_clear_canvas_manual_refine_updates,
+        inputs=[],
+        outputs=[c["canvas_original_rgb_state"], c["canvas_auto_rgba_state"],
+                 c["canvas_current_rgba_state"], c["canvas_edit_history_state"],
+                 c["canvas_enter_refine_btn"], c["canvas_result_editor"],
+                 c["canvas_editor_actions"], c["canvas_preview_actions"],
+                 c["canvas_result_title"]],
+        queue=False, show_progress="hidden",
     )
 
     c["clear_btn"].click(

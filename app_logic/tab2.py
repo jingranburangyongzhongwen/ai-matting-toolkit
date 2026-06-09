@@ -1,5 +1,7 @@
 # ── Tab 2 后端：精细选区 ────────────────────────────────────────
+import base64
 import hashlib
+import io
 import os
 import threading
 from collections import OrderedDict
@@ -1090,18 +1092,22 @@ def _sam_guided_rmbg_alpha(image, sam_mask, points_state, labels_state, box_stat
 
 # ── Tab 2 回调 ──────────────────────────────────────────────────
 
-def on_image_upload(files, request: gr.Request = None):
+def on_image_upload(image, request: gr.Request = None):
+    """接收 numpy 数组（来自 gr.Image 上传/粘贴）。"""
     _clear_session_sam_contexts(request)
     empty_auto_choice = _ensure_auto_choice({"selected": [], "excluded": []})
-    if not files:
+    if image is None:
         return (gr.update(value=None, visible=True), gr.update(value=None, visible=False),
                 gr.update(visible=False), gr.update(visible=False), gr.update(visible=False),
                 gr.update(value=None, visible=False), [], [], None, None,
                 [], empty_auto_choice, "", "请先上传图片")
-    first = files[0] if isinstance(files, list) else files
     try:
-        img = Image.open(first).convert("RGB")
-        return (gr.update(visible=False), gr.update(value=np.array(img), visible=True),
+        img = np.asarray(image)
+        if img.ndim == 2:
+            img = np.stack([img] * 3, axis=-1)
+        elif img.shape[2] == 4:
+            img = img[:, :, :3]
+        return (gr.update(visible=False), gr.update(value=img, visible=True),
                 gr.update(visible=True), gr.update(visible=True), gr.update(visible=False),
                 gr.update(value=None, visible=False), [], [], None, None,
                 [], empty_auto_choice, "",
@@ -1470,6 +1476,57 @@ def on_generate_cutout(image, engine_mode, output_mode, points_state,
                f"生成失败: {e}", *empty_states)
 
 
+def on_undo_point(image, points_state, labels_state, box_state,
+                  auto_masks_state, auto_choice_state,
+                  engine_mode, request: gr.Request = None):
+    """撤销最后一个点，重新预测 mask。"""
+    empty = _ensure_auto_choice(auto_choice_state)
+    if image is None or not points_state:
+        return (image, gr.update(visible=False), gr.update(value=None, visible=False),
+                points_state, labels_state, box_state, empty, "没有可撤销的标记")
+
+    new_points = list(points_state[:-1])
+    new_labels = list(labels_state[:-1])
+
+    if not new_points:
+        _reset_session_sam_interaction_state(request)
+        if auto_masks_state:
+            sel, excl = _auto_choice_selected_excluded(empty, auto_masks_state)
+            overlay = _draw_auto_segment_overlay(image, auto_masks_state, sel, excl)
+        else:
+            overlay = image
+        return (overlay, gr.update(visible=False), gr.update(value=None, visible=False),
+                [], [], box_state, empty, "已撤销所有标记")
+
+    try:
+        ctx = _ensure_sam_ready(
+            image, engine_mode,
+            keep_grounding_dino=True, retain=True, request=request,
+        )
+        try:
+            mask = _predict_tab2_mask(
+                ctx, new_points, new_labels, box_state,
+                auto_masks_state, empty, image_shape=image.shape,
+            )
+        finally:
+            _release_sam_context(ctx)
+
+        overlay_boxes = None if auto_masks_state else box_state
+        if auto_masks_state:
+            sel, excl = _auto_choice_selected_excluded(empty, auto_masks_state)
+            base = _draw_auto_segment_overlay(image, auto_masks_state, sel, excl)
+            overlay = _draw_tab2_overlay(base, mask, new_points, new_labels, overlay_boxes, opacity=0.35)
+        else:
+            overlay = _draw_tab2_overlay(image, mask, new_points, new_labels, overlay_boxes)
+
+        return (overlay, gr.update(visible=True), gr.update(value=None, visible=False),
+                new_points, new_labels, box_state, empty,
+                f"已撤销，剩余 {len(new_points)} 个标记")
+    except Exception as e:
+        return (image, gr.update(visible=False), gr.update(value=None, visible=False),
+                new_points, new_labels, box_state, empty, f"撤销失败: {e}")
+
+
 def on_clear_points(image, request: gr.Request = None):
     empty = _ensure_auto_choice({"selected": [], "excluded": []})
     if image is None:
@@ -1488,6 +1545,19 @@ def on_engine_mode_change(image, request: gr.Request = None):
                 [], [], None, [], empty, "", "请先上传图片")
     return (None, gr.update(visible=False), gr.update(value=None, visible=False),
             [], [], None, [], empty, "", "引擎已切换，请重新标记")
+
+
+def on_paste_decode(data_url):
+    """将粘贴的 base64 data URL 解码为 numpy 数组，供 on_image_upload 使用。"""
+    if not data_url or not data_url.startswith("data:"):
+        return None
+    try:
+        header, b64data = data_url.split(",", 1)
+        img_bytes = base64.b64decode(b64data)
+        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        return np.array(img)
+    except Exception:
+        return None
 
 
 def clear_result_preview_on_start(source, result):

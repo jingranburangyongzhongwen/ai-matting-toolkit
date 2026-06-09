@@ -88,10 +88,22 @@ def _has_source_content(source):
     return True
 
 
-def on_auto_process(files, source_img, detect_transparent, vitmatte_variant,
+def on_auto_process(files, single_img, source_img, detect_transparent, vitmatte_variant,
                     process_mode, save_debug=False):
     yield (gr.update(), "开始处理...", None, gr.update(visible=False), gr.update(visible=False),
            gr.update(), gr.update(), gr.update(), gr.update(visible=False))
+
+    # 统一文件列表：单张模式从 numpy 保存临时文件，批量模式直接用文件列表
+    if single_img is not None:
+        import tempfile
+        img_arr = np.asarray(single_img)
+        if img_arr.ndim == 2:
+            img_arr = np.stack([img_arr] * 3, axis=-1)
+        elif img_arr.shape[2] == 4:
+            img_arr = img_arr[:, :, :3]
+        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        Image.fromarray(img_arr).save(tmp.name)
+        files = [tmp.name]
     if not files:
         yield (gr.update(), "请先上传图片", None, gr.update(visible=False), gr.update(visible=False),
                gr.update(), gr.update(), gr.update(), gr.update(visible=False))
@@ -188,25 +200,48 @@ def on_auto_process(files, source_img, detect_transparent, vitmatte_variant,
         yield gr.update(), "没有有效图片被处理", gr.update(), gr.update(visible=False), gr.update(visible=False), gr.update(), gr.update(), gr.update(), gr.update(visible=False)
 
 
-def on_auto_upload(files):
+def on_auto_upload(image):
+    """接收 numpy 数组（来自 gr.Image 上传/粘贴）。返回 8 值。"""
+    if image is None:
+        return (gr.update(), gr.update(value=None, visible=False),
+                gr.update(visible=False), gr.update(visible=False), None,
+                gr.update(visible=False), gr.update(value=None, visible=False), "请先上传图片")
+    try:
+        img = np.asarray(image)
+        if img.ndim == 2:
+            img = np.stack([img] * 3, axis=-1)
+        elif img.shape[2] == 4:
+            img = img[:, :, :3]
+        return (gr.update(), gr.update(value=img, visible=True),
+                gr.update(visible=True), gr.update(visible=True), None,
+                gr.update(visible=False), gr.update(value=None, visible=False), "图片已上传，点击开始抠图")
+    except Exception:
+        return (gr.update(), gr.update(value=None, visible=False),
+                gr.update(visible=False), gr.update(visible=False), None,
+                gr.update(visible=False), gr.update(value=None, visible=False), "图片加载失败")
+
+
+def on_auto_upload_from_file(files):
+    """接收文件列表（来自 gr.File 上传）。返回 8 值。"""
     if not files:
-        return gr.update(value=None, visible=True), gr.update(value=None, visible=False), \
-            gr.update(visible=False), gr.update(visible=False), None, \
-            gr.update(visible=False), gr.update(value=None, visible=False), "请先上传图片"
+        return (gr.update(value=None, visible=True), gr.update(value=None, visible=False),
+                gr.update(visible=False), gr.update(visible=False), None,
+                gr.update(visible=False), gr.update(value=None, visible=False), "请先上传图片")
     first = files[0] if isinstance(files, list) else files
     try:
         img = Image.open(first).convert("RGB")
-        return gr.update(visible=False), gr.update(value=np.array(img), visible=True), \
-            gr.update(visible=True), gr.update(visible=True), None, \
-            gr.update(visible=False), gr.update(value=None, visible=False), "图片已上传，点击开始抠图"
+        return (gr.update(visible=False), gr.update(value=np.array(img), visible=True),
+                gr.update(visible=True), gr.update(visible=True), None,
+                gr.update(visible=False), gr.update(value=None, visible=False), "图片已上传，点击开始抠图")
     except Exception:
-        return gr.update(value=None, visible=True), gr.update(value=None, visible=False), \
-            gr.update(visible=False), gr.update(visible=False), None, \
-            gr.update(visible=False), gr.update(value=None, visible=False), "图片加载失败"
+        return (gr.update(value=None, visible=True), gr.update(value=None, visible=False),
+                gr.update(visible=False), gr.update(visible=False), None,
+                gr.update(visible=False), gr.update(value=None, visible=False), "图片加载失败")
 
 
 def on_auto_clear_source():
-    return gr.update(value=None, visible=True), gr.update(value=None, visible=False), \
+    return gr.update(value=None, visible=True), gr.update(value=None), \
+        gr.update(value=None, visible=False), \
         gr.update(visible=False), gr.update(visible=False), None, \
         gr.update(visible=False), gr.update(value=None, visible=False), "请先上传图片"
 
@@ -214,6 +249,13 @@ def on_auto_clear_source():
 def on_vitmatte_variant_change(vitmatte_variant):
     variant_key = VITMATTE_VARIANTS.get(vitmatte_variant, "none")
     return gr.update(visible=(variant_key != "none"))
+
+
+def on_upload_mode_change(mode):
+    """切换单张/批量上传模式。"""
+    if mode == "单张":
+        return gr.update(visible=True), gr.update(visible=False)
+    return gr.update(visible=False), gr.update(visible=True)
 
 
 # ── build_ui ────────────────────────────────────────────────────
@@ -228,9 +270,11 @@ def build_ui(model_concurrency_limit=2):
         tab2_comps = build_tab2_ui()
         tab1_callbacks = {
             "on_auto_upload": on_auto_upload,
+            "on_auto_upload_from_file": on_auto_upload_from_file,
             "on_auto_clear_source": on_auto_clear_source,
             "on_auto_process": on_auto_process,
             "on_vitmatte_variant_change": on_vitmatte_variant_change,
+            "on_upload_mode_change": on_upload_mode_change,
         }
         bind_tab1_events(demo, tab1_comps, model_concurrency_limit, tab1_callbacks)
         bind_tab2_events(demo, tab2_comps, model_concurrency_limit)

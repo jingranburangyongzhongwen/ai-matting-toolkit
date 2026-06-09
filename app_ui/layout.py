@@ -420,6 +420,35 @@ APP_JS = """
         event.stopPropagation();
         openLightbox(image.currentSrc || image.src);
     }, true);
+
+    // 全局粘贴：Ctrl+V 将图片 base64 写入隐藏 Textbox
+    document.addEventListener("paste", (event) => {
+        const tag = document.activeElement?.tagName;
+        if (tag === "INPUT" || tag === "TEXTAREA") return;
+        const items = event.clipboardData?.items;
+        if (!items) return;
+        for (const item of items) {
+            if (!item.type.startsWith("image/")) continue;
+            const blob = item.getAsFile();
+            if (!blob) break;
+            event.preventDefault();
+            const reader = new FileReader();
+            reader.onload = () => {
+                // 找到隐藏的 paste textbox 并写入 base64
+                const boxes = document.querySelectorAll('textarea[data-testid="textbox"]');
+                for (const box of boxes) {
+                    if (!box.placeholder?.includes("__paste__")) continue;
+                    const setter = Object.getOwnPropertyDescriptor(
+                        HTMLTextAreaElement.prototype, 'value').set;
+                    setter.call(box, reader.result);
+                    box.dispatchEvent(new Event('input', { bubbles: true }));
+                    break;
+                }
+            };
+            reader.readAsDataURL(blob);
+            break;
+        }
+    });
 })();
 """
 
@@ -486,6 +515,9 @@ def build_tab1_ui():
                     label="上传原图（支持多张，不支持粘贴）", file_count="multiple",
                     file_types=["image"], elem_classes="upload-area",
                     visible=False,
+                )
+                comps["paste_box"] = gr.Textbox(
+                    placeholder="__paste__", visible=False, max_lines=1,
                 )
                 comps["auto_input_img"] = gr.Image(
                     label="原图", visible=False, interactive=False,
@@ -632,6 +664,9 @@ def build_tab2_ui():
                     sources=["upload", "clipboard"], type="numpy",
                     label="上传原图（支持粘贴 Ctrl+V）",
                     elem_classes="upload-area",
+                )
+                comps["paste_box"] = gr.Textbox(
+                    placeholder="__paste__", visible=False, max_lines=1,
                 )
                 comps["canvas_img"] = gr.Image(
                     label="原图", type="numpy", visible=False,
