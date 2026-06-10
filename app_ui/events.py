@@ -58,6 +58,7 @@ def bind_tab1_events(demo, c, model_concurrency_limit, callbacks):
     # 清空原图
     c["auto_swap_btn"].click(
         fn=callbacks["on_auto_clear_source"],
+        inputs=[c["upload_mode"]],
         outputs=[c["auto_files"], c["auto_single_img"], c["auto_input_img"], c["auto_input_view_btn"],
                  c["auto_swap_btn"], c["auto_result_img"], c["auto_result_view_btn"],
                  c["auto_result_download_btn"], c["auto_status"]],

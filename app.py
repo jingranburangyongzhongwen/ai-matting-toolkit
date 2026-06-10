@@ -238,8 +238,10 @@ def on_auto_upload_from_file(files):
                 gr.update(visible=False), gr.update(value=None, visible=False), "图片加载失败")
 
 
-def on_auto_clear_source():
-    return gr.update(value=None, visible=True), gr.update(value=None, visible=True), \
+def on_auto_clear_source(upload_mode):
+    """清空原图；按当前上传模式只恢复对应的上传入口。"""
+    single = upload_mode == "单张"
+    return gr.update(value=None, visible=not single), gr.update(value=None, visible=single), \
         gr.update(value=None, visible=False), \
         gr.update(visible=False), gr.update(visible=False), None, \
         gr.update(visible=False), gr.update(value=None, visible=False), "请先上传图片"
