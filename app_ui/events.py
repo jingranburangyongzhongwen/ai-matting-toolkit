@@ -18,8 +18,9 @@ def bind_tab1_events(demo, c, model_concurrency_limit, callbacks):
         queue=False, show_progress="hidden",
     )
 
-    # 单张上传/粘贴
-    c["auto_single_img"].change(
+    # 单张上传/粘贴：用 .upload 而非 .change，避免隐藏上传区时 Gradio 6
+    # 再触发 change(None) 把预览闪回上传区
+    c["auto_single_img"].upload(
         fn=callbacks["on_auto_upload"],
         inputs=[c["auto_single_img"]],
         outputs=[c["auto_single_img"], c["auto_input_img"], c["auto_input_view_btn"],
@@ -27,20 +28,12 @@ def bind_tab1_events(demo, c, model_concurrency_limit, callbacks):
                  c["auto_result_download_btn"], c["auto_status"]],
         queue=False, show_progress="hidden",
     )
-    c["auto_single_img"].change(
+    c["auto_single_img"].upload(
         fn=_clear_manual_refine_updates,
         inputs=[],
         outputs=[c["original_rgb_state"], c["auto_rgba_state"], c["current_rgba_state"],
                  c["edit_history_state"], c["enter_refine_btn"], c["auto_result_editor"],
                  c["editor_actions"], c["preview_actions"], c["result_title"]],
-        queue=False, show_progress="hidden",
-    )
-
-    # 粘贴解码 → 写入 Image 组件（触发上面的 change 事件）
-    c["paste_box"].change(
-        fn=tab2.on_paste_decode,
-        inputs=[c["paste_box"]],
-        outputs=[c["auto_single_img"]],
         queue=False, show_progress="hidden",
     )
 
@@ -177,7 +170,7 @@ def bind_tab2_events(demo, c, model_concurrency_limit):
         queue=False, show_progress="hidden",
     )
 
-    c["canvas_files"].change(
+    c["canvas_files"].upload(
         fn=tab2.on_image_upload,
         inputs=[c["canvas_files"]],
         outputs=[c["canvas_files"], c["canvas_img"], c["canvas_view_btn"],
@@ -187,7 +180,7 @@ def bind_tab2_events(demo, c, model_concurrency_limit):
                  c["text_caption"], c["cutout_status"]],
         queue=False, show_progress="hidden",
     )
-    c["canvas_files"].change(
+    c["canvas_files"].upload(
         fn=_clear_canvas_manual_refine_updates,
         inputs=[],
         outputs=[c["canvas_original_rgb_state"], c["canvas_auto_rgba_state"],
@@ -195,13 +188,6 @@ def bind_tab2_events(demo, c, model_concurrency_limit):
                  c["canvas_enter_refine_btn"], c["canvas_result_editor"],
                  c["canvas_editor_actions"], c["canvas_preview_actions"],
                  c["canvas_result_title"]],
-        queue=False, show_progress="hidden",
-    )
-    # 粘贴解码 → 写入 Image 组件（触发上面的 change 事件）
-    c["paste_box"].change(
-        fn=tab2.on_paste_decode,
-        inputs=[c["paste_box"]],
-        outputs=[c["canvas_files"]],
         queue=False, show_progress="hidden",
     )
     c["canvas_swap_btn"].click(

@@ -1,7 +1,5 @@
 # ── Tab 2 后端：精细选区 ────────────────────────────────────────
-import base64
 import hashlib
-import io
 import os
 import threading
 from collections import OrderedDict
@@ -1097,17 +1095,14 @@ def on_image_upload(image, request: gr.Request = None):
     _clear_session_sam_contexts(request)
     empty_auto_choice = _ensure_auto_choice({"selected": [], "excluded": []})
     if image is None:
-        return (gr.update(value=None, visible=True), gr.update(value=None, visible=False),
-                gr.update(visible=False), gr.update(visible=False), gr.update(visible=False),
-                gr.update(value=None, visible=False), [], [], None, None,
-                [], empty_auto_choice, "", "请先上传图片")
+        return tuple(gr.update() for _ in range(14))
     try:
         img = np.asarray(image)
         if img.ndim == 2:
             img = np.stack([img] * 3, axis=-1)
         elif img.shape[2] == 4:
             img = img[:, :, :3]
-        return (gr.update(visible=False), gr.update(value=img, visible=True),
+        return (gr.update(value=None, visible=False), gr.update(value=img, visible=True),
                 gr.update(visible=True), gr.update(visible=True), gr.update(visible=False),
                 gr.update(value=None, visible=False), [], [], None, None,
                 [], empty_auto_choice, "",
@@ -1545,19 +1540,6 @@ def on_engine_mode_change(image, request: gr.Request = None):
                 [], [], None, [], empty, "", "请先上传图片")
     return (None, gr.update(visible=False), gr.update(value=None, visible=False),
             [], [], None, [], empty, "", "引擎已切换，请重新标记")
-
-
-def on_paste_decode(data_url):
-    """将粘贴的 base64 data URL 解码为 numpy 数组，供 on_image_upload 使用。"""
-    if not data_url or not data_url.startswith("data:"):
-        return None
-    try:
-        header, b64data = data_url.split(",", 1)
-        img_bytes = base64.b64decode(b64data)
-        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        return np.array(img)
-    except Exception:
-        return None
 
 
 def clear_result_preview_on_start(source, result):

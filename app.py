@@ -203,16 +203,15 @@ def on_auto_process(files, single_img, source_img, detect_transparent, vitmatte_
 def on_auto_upload(image):
     """接收 numpy 数组（来自 gr.Image 上传/粘贴）。返回 8 值。"""
     if image is None:
-        return (gr.update(), gr.update(value=None, visible=False),
-                gr.update(visible=False), gr.update(visible=False), None,
-                gr.update(visible=False), gr.update(value=None, visible=False), "请先上传图片")
+        return tuple(gr.update() for _ in range(8))
     try:
         img = np.asarray(image)
         if img.ndim == 2:
             img = np.stack([img] * 3, axis=-1)
         elif img.shape[2] == 4:
             img = img[:, :, :3]
-        return (gr.update(), gr.update(value=img, visible=True),
+        # 隐藏上传区、仅在中栏预览区显示原图（保留上传区 value 供开始抠图读取）
+        return (gr.update(visible=False), gr.update(value=img, visible=True),
                 gr.update(visible=True), gr.update(visible=True), None,
                 gr.update(visible=False), gr.update(value=None, visible=False), "图片已上传，点击开始抠图")
     except Exception:
@@ -240,7 +239,7 @@ def on_auto_upload_from_file(files):
 
 
 def on_auto_clear_source():
-    return gr.update(value=None, visible=True), gr.update(value=None), \
+    return gr.update(value=None, visible=True), gr.update(value=None, visible=True), \
         gr.update(value=None, visible=False), \
         gr.update(visible=False), gr.update(visible=False), None, \
         gr.update(visible=False), gr.update(value=None, visible=False), "请先上传图片"
@@ -266,6 +265,8 @@ def build_ui(model_concurrency_limit=2):
 
     with gr.Blocks(title="全自动抠图") as demo:
         gr.Markdown("# 全自动抠图工具")
+        # Ctrl+V 粘贴由前端 JS 实现：把剪贴板图片注入上传组件的
+        # file input，复用 Gradio 原生上传流程（见 layout.APP_JS）
         tab1_comps = build_tab1_ui()
         tab2_comps = build_tab2_ui()
         tab1_callbacks = {

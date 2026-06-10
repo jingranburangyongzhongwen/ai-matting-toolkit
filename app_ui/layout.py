@@ -5,6 +5,14 @@ from model_manager import VITMATTE_VARIANTS, VITMATTE_PROCESS_MODES
 from app_logic.tab2 import ENGINE_MODE_MAP, TAB2_OUTPUT_MODES, _ensure_auto_choice
 
 
+# 中栏上传文案（Tab 1 / Tab 2 共用）
+SOURCE_SECTION_HTML = (
+    '<div class="section-title">原图 '
+    '<span class="section-hint">支持点击上传或 Ctrl+V 粘贴</span></div>'
+)
+SOURCE_UPLOAD_LABEL = "上传或粘贴图片"
+
+
 # ── CSS ──────────────────────────────────────────────────────────
 
 APP_CSS = """
@@ -362,6 +370,22 @@ APP_JS = """
     if (window.__mattingLightboxReady) return;
     window.__mattingLightboxReady = true;
 
+    const pasteDebugEnabled = () => {
+        const panels = [...document.querySelectorAll('[role="tabpanel"]')];
+        const idx = activeTabIndex();
+        const panel = panels[idx >= 0 ? idx : 0];
+        if (!panel) return false;
+        for (const input of panel.querySelectorAll('input[type="checkbox"]')) {
+            const label = input.closest("label")?.textContent || "";
+            if (label.includes("保存诊断")) return input.checked;
+        }
+        return false;
+    };
+
+    const pasteLog = (...args) => {
+        if (pasteDebugEnabled()) console.log("[matting:paste]", ...args);
+    };
+
     const ensureLightbox = () => {
         let overlay = document.querySelector(".image-lightbox-overlay");
         if (overlay) return overlay;
@@ -421,31 +445,87 @@ APP_JS = """
         openLightbox(image.currentSrc || image.src);
     }, true);
 
-    // 全局粘贴：Ctrl+V 将图片 base64 写入隐藏 Textbox
+    const activeTabIndex = () => {
+        const tabs = [...document.querySelectorAll('[role="tab"]')];
+        return tabs.findIndex((tab) => tab.getAttribute("aria-selected") === "true");
+    };
+
+    const activeTabPanel = () => {
+        const panels = [...document.querySelectorAll('[role="tabpanel"]')];
+        // 未隐藏（display:none 的元素 offsetParent 为 null）的面板即当前 Tab
+        return panels.find((p) => p.offsetParent !== null) || panels[0] || null;
+    };
+
+    // 优先可见上传区；预览显示时上传区可能 display:none 但 file input 仍在 DOM
+    const findPasteFileInput = (panel) => {
+        const inputs = [...panel.querySelectorAll('.upload-area input[type="file"]')];
+        const visible = inputs.find((input) => {
+            const area = input.closest(".upload-area");
+            return area && area.offsetParent !== null;
+        });
+        return visible || inputs[0] || null;
+    };
+
+    // 把粘贴得到的 File 注入 file input，走 Gradio 原生上传流程。
+    // Gradio 6（Svelte 5）不响应合成的 input/change 文本事件，
+    // 但 Upload 组件监听 file input 的 change，programmatic 注入有效。
+    const injectFile = (input, file) => {
+        const dt = new DataTransfer();
+        dt.items.add(file);
+        input.files = dt.files;
+        input.dispatchEvent(new Event("change", { bubbles: true }));
+    };
+
+    const tryPasteInject = (panel, file, attempt) => {
+        const input = findPasteFileInput(panel);
+        if (input) {
+            injectFile(input, file);
+            pasteLog("injected", { name: file.name, size: file.size, attempt });
+            return;
+        }
+        // 不在粘贴时自动点「清空」——会与上传回调竞态，导致预览闪回上传区
+        if (attempt < 8) {
+            setTimeout(() => tryPasteInject(panel, file, attempt + 1), 120);
+        } else {
+            pasteLog("give up: file input not found");
+        }
+    };
+
+    // 全局粘贴：Ctrl+V → File 注入当前 Tab 的上传组件
     document.addEventListener("paste", (event) => {
         const tag = document.activeElement?.tagName;
-        if (tag === "INPUT" || tag === "TEXTAREA") return;
+        if (tag === "INPUT" || tag === "TEXTAREA") {
+            pasteLog("ignored: focus in text field", tag);
+            return;
+        }
         const items = event.clipboardData?.items;
-        if (!items) return;
+        if (!items) {
+            pasteLog("ignored: no clipboard items");
+            return;
+        }
         for (const item of items) {
             if (!item.type.startsWith("image/")) continue;
             const blob = item.getAsFile();
-            if (!blob) break;
+            if (!blob) {
+                pasteLog("ignored: image item has no blob");
+                break;
+            }
+            const panel = activeTabPanel();
+            if (!panel) {
+                pasteLog("ignored: no active tab panel");
+                break;
+            }
             event.preventDefault();
-            const reader = new FileReader();
-            reader.onload = () => {
-                // 找到隐藏的 paste textbox 并写入 base64
-                const boxes = document.querySelectorAll('textarea[data-testid="textbox"]');
-                for (const box of boxes) {
-                    if (!box.placeholder?.includes("__paste__")) continue;
-                    const setter = Object.getOwnPropertyDescriptor(
-                        HTMLTextAreaElement.prototype, 'value').set;
-                    setter.call(box, reader.result);
-                    box.dispatchEvent(new Event('input', { bubbles: true }));
-                    break;
-                }
-            };
-            reader.readAsDataURL(blob);
+            const ext = (item.type.split("/")[1] || "png").replace("jpeg", "jpg");
+            const file = new File([blob], `pasted-${Date.now()}.${ext}`, {
+                type: item.type,
+            });
+            pasteLog("image paste", {
+                tabIndex: activeTabIndex(),
+                type: item.type,
+                size: blob.size,
+            });
+            tryPasteInject(panel, file, 0);
             break;
         }
     });
@@ -501,23 +581,17 @@ def build_tab1_ui():
 
             # 中栏
             with gr.Column(scale=4, elem_classes="panel-card"):
-                gr.Markdown(
-                    '<div class="section-title">原图 '
-                    '<span class="section-hint">上传后在这里确认待处理图片</span></div>'
-                )
+                gr.Markdown(SOURCE_SECTION_HTML)
                 comps["auto_single_img"] = gr.Image(
                     sources=["upload", "clipboard"], type="numpy",
-                    label="上传或粘贴图片",
+                    label=SOURCE_UPLOAD_LABEL,
                     visible=True, interactive=True,
                     elem_classes="upload-area",
                 )
                 comps["auto_files"] = gr.File(
-                    label="上传原图（支持多张，不支持粘贴）", file_count="multiple",
+                    label="批量上传原图（不支持粘贴）", file_count="multiple",
                     file_types=["image"], elem_classes="upload-area",
                     visible=False,
-                )
-                comps["paste_box"] = gr.Textbox(
-                    placeholder="__paste__", visible=False, max_lines=1,
                 )
                 comps["auto_input_img"] = gr.Image(
                     label="原图", visible=False, interactive=False,
@@ -656,17 +730,12 @@ def build_tab2_ui():
 
             # 中栏
             with gr.Column(scale=4, elem_classes="panel-card"):
-                gr.Markdown(
-                    '<div class="section-title">原图 '
-                    '<span class="section-hint">点击图片选取/排除，绿色=正向，红色=负向</span></div>'
-                )
+                gr.Markdown(SOURCE_SECTION_HTML)
                 comps["canvas_files"] = gr.Image(
                     sources=["upload", "clipboard"], type="numpy",
-                    label="上传原图（支持粘贴 Ctrl+V）",
+                    label=SOURCE_UPLOAD_LABEL,
+                    interactive=True,
                     elem_classes="upload-area",
-                )
-                comps["paste_box"] = gr.Textbox(
-                    placeholder="__paste__", visible=False, max_lines=1,
                 )
                 comps["canvas_img"] = gr.Image(
                     label="原图", type="numpy", visible=False,
