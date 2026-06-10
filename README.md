@@ -7,9 +7,10 @@
 - **离线本地 + 绿色免安装** — 全链路本机推理，无需联网、无需上传云端；打包后无需依赖即可运行
 - **一键批量抠图** — 多图拖入，自动识别主体，输出透明 PNG 到 `output/`
 - **文本定位 + 精细选区** — 正负向点选/框选，蒙版实时预览；可选中英文描述自动框物（Grounding-DINO → SAM），支持继续加点修正；MobileSAM（快）/ SAM-HQ（高精）双引擎
-- **多模型融合** — 精细模式可选 SAM 严格边界，或 SAM 定主体 + RMBG 在 ROI 内约束融合（多主体效果会差）；批量模式 RMBG 全图，可选 ViTMatte 精修软边（大部分情况效果不如直出）
+- **多模型融合** — 精细模式默认 SAM 定主体 + RMBG 在 ROI 内约束融合生成软 alpha；也可选 SAM 严格二值硬边界快速导出；批量模式 RMBG 全图，可选 ViTMatte 精修软边（大部分情况效果不如直出）
 - **涂抹式边缘修复** — 一键抠图 / 精细选区完成后均可进入修复模式：ViTMatte 重估高 alpha 发丝、regularized unmix 去色边；支持绿/蓝/红/黄/青/品红等纯色幕布的 screen chroma 诊断与回滚保护
 - **结果导出** — 两 Tab 预览区均支持「查看大图」与「下载」透明 PNG；修复结果另存为 `output/refined*.png`
+- **原图中栏** — 两 Tab 中栏均支持点击上传与 **Ctrl+V 粘贴**剪贴板图片；换图须先点「清空原图区」（预览显示后上传入口会从页面卸载，无法直接覆盖）
 - **显存管理** — 模型按需加载、用完可卸，减轻显卡压力；默认适合单人使用、尽量省显存；多人同时开多个浏览器页时，每人选区分开保存，并限制「同时处理几张」和排队人数，避免显卡一次占满
 
 ## 功能说明
@@ -40,7 +41,7 @@ flowchart TB
       M2_TL[文本定位] -.-> M2_GD[Grounding-DINO] -.-> M2_INT
       M2_INT -->|开始抠图| M2_MSK[SAM mask + 主体框]
       M2_MSK --> M2_MODE{输出模式?}
-      M2_MODE -->|SAM严格| M2_STRICT[SAM 边界收边 + 负向点]
+      M2_MODE -->|SAM严格| M2_STRICT[SAM 二值硬边界 + 负向点]
       M2_MODE -->|RMBG精修| M2_ROI[扩边 ROI crop]
       M2_ROI --> M2_RMBG[RMBG predict_alpha]
       M2_RMBG --> M2_EDGE{前景贴 ROI 边?}
@@ -89,14 +90,20 @@ flowchart TB
 - 模式一 **直出**：RMBG → 清理/平滑 → 后处理；不跑 ViTMatte，也不调用 Grounding-DINO。
 - 模式一 **ViTMatte 精修**：在 RMBG alpha 上内部生成窄 unknown trimap 再精修；若同时勾选「检测透明物体」，DINO 用于修正 trimap（非直出路径）。
 - 模式一勾选「检测透明物体」且为直出时：仅在后处理阶段加强半透明保护，**不跑 DINO 检测**。
-- 模式二 **不走 ViTMatte**；输出二选一：**SAM严格**（纯 SAM 边界，不调 RMBG）或 **RMBG精修**（ROI 内 RMBG + 约束融合）。低显存下 SAM-HQ 与 RMBG 可能同时驻留，建议 ≥8GB 显存或优先 MobileSAM。
+- 模式二 **不走 ViTMatte**；输出二选一：**SAM严格**（纯 SAM 二值硬边界，不调 RMBG，最快）或 **RMBG精修**（SAM 定主体，ROI 内 RMBG + 约束融合，默认推荐）。低显存下 SAM-HQ 与 RMBG 可能同时驻留，建议 ≥8GB 显存或优先 MobileSAM。
 - 两种模式导出前都会走自动 RGB 去色边：使用 alpha 外侧背景 seed 估计局部背景方向，只在背景可信且边缘确有背景色残留时修正；透明保护区与细节区保持保守。
 - 默认 **单 session 低显存**；多人/多标签页加 `--multi-session`（每页独立 SAM predictor / embedding / 点击先验，SAM 会话 LRU，默认最多 8 个）。
+
+### 原图上传（两 Tab 中栏）
+
+- **点击上传** 或 **Ctrl+V 粘贴**（焦点需在页面内、且不在文本输入框中）
+- 上传/粘贴成功后在中栏显示原图预览；**更换图片须先点「清空原图区」** 再重新上传或粘贴
+- 一键抠图可选 **单张** / **批量**：单张支持粘贴；批量为多文件选择（不支持粘贴）
 
 ### 模式一：一键抠图
 
 1. 打开 **一键抠图** 标签页
-2. 拖入单张或多张图片
+2. 中栏上传或粘贴原图（批量模式可一次选多张）
 3. （可选）勾选「检测透明物体」— 直出时保护半透明区域；配合 ViTMatte 时另用 DINO 修正 trimap
 4. （可选）精修模型：默认直出，或 Small / Base / MatAny
 5. （可选）勾选「保存诊断中间结果」
@@ -148,12 +155,15 @@ python scripts/test_manual_refine.py --debug-dir output/_test_manual
 
 ### 模式二：精细选区
 
-1. 打开 **精细选区** 标签页，上传单张图
-2. **正向选取** / **负向排除**；引擎选 MobileSAM 或 SAM-HQ
-3. 打点预览（仅 SAM）；可选 **文本定位**（DINO 框选 → SAM）
+1. 打开 **精细选区** 标签页，中栏上传或粘贴单张原图
+2. 三种方式获取选区（可混用）：
+   - **直接点图** — 正向/负向点选，SAM 实时预览
+   - **文本定位** — 输入描述（如 `goose`），DINO 自动框选 → SAM 分割
+   - **检测** — SAM 自动识别全部候选主体，点选/排除
+3. 继续打点精修直到满意
 4. 选择 **输出模式**：
-   - **SAM严格** — SAM 边界 + 负向点，不调用 RMBG，最快、边界最贴 SAM
-   - **RMBG精修** — SAM 定主体，RMBG 在 ROI 内融合 alpha（默认推荐）
+   - **SAM严格** — SAM 二值硬边界 + 负向点，不调用 RMBG，最快、边界最贴 SAM
+   - **RMBG精修** — SAM 定主体，RMBG 在 ROI 内融合 alpha（默认推荐，高质量路径）
 5. （可选）「保护透明/半透明材质」— 后处理保留物体内部软 alpha
 6. （可选）「保存诊断中间结果」
 7. 点击 **开始抠图** → RGBA 后处理 → 保存到 `output/`
@@ -163,8 +173,14 @@ python scripts/test_manual_refine.py --debug-dir output/_test_manual
 
 ```
 ai-matting-toolkit/
-├── app.py                 # Gradio Web UI 与业务流程
+├── app.py                 # 入口：初始化、Tab1 回调、UI 构建、CLI
 ├── model_manager.py       # 模型懒加载、设备与路径
+├── app_logic/
+│   ├── tab2.py            # Tab2 全部后端：SAM 会话、box 几何、预测、overlay、alpha 生成、回调
+│   └── refine.py          # 手动边缘修复回调（Tab1 / Tab2 共用）
+├── app_ui/
+│   ├── layout.py          # CSS / JS + Gradio 组件布局
+│   └── events.py          # Tab1 / Tab2 事件绑定
 ├── engines/
 │   ├── rmbg2.py           # RMBG-2.0 全图 / ROI alpha
 │   ├── vitmatte.py        # ViTMatte 精修与手动修复推理
@@ -320,6 +336,12 @@ A: 首次加载模型较慢；建议使用 NVIDIA GPU。单 session 会在任务
 
 **Q: 支持哪些格式？**  
 A: JPG、PNG、BMP、WEBP、TIFF
+
+**Q: Ctrl+V 粘贴没反应？**  
+A: 确保焦点不在左侧状态框或文本定位输入框内；粘贴的是图片而非纯文本。已有预览时须先点「清空原图区」再粘贴。
+
+**Q: 为什么换图要先清空？**  
+A: 预览显示后 Gradio 6 会卸载上传组件，粘贴/上传入口不再存在，故需先清空再载入新图。
 
 ## 技术栈
 

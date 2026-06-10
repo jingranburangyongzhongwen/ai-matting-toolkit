@@ -20,20 +20,23 @@ class SAMHQSession(BaseSAMSession):
 
 
 class SAMHQEngine:
-    def __init__(self, model_path: str, device: str = "cpu"):
+    def __init__(self, model_path: str, device: str = "cpu", model_type: str = "vit_l"):
         self.device = device
         self.model = None
         self._predictor_cls = None
         self.model_path = model_path
+        self.model_type = model_type
 
     def _load_model(self):
         if self.model is not None:
             return
-        print(f"[SAM-HQ] 加载模型到 {self.device} ...")
+        print(f"[SAM-HQ] 加载 {self.model_type} 模型到 {self.device} ...")
         from segment_anything_hq import sam_model_registry, SamPredictor
 
         checkpoint = self._find_checkpoint()
-        self.model = sam_model_registry["vit_l"](checkpoint=checkpoint)
+        if self.model_type not in sam_model_registry:
+            raise ValueError(f"SAM-HQ 不支持 model_type={self.model_type}")
+        self.model = sam_model_registry[self.model_type](checkpoint=checkpoint)
         self.model.to(self.device)
         self.model.eval()
         self._predictor_cls = SamPredictor
@@ -56,19 +59,38 @@ class SAMHQEngine:
 
     def _find_checkpoint(self) -> str:
         """查找 SAM-HQ 模型文件"""
-        for name in [
-            "sam_hq_vit_l.pth",
-            "sam_hq_vit_b.pth",
-            "sam_hq_vit_h.pth",
-        ]:
+        candidates = {
+            "vit_b": ["sam_hq_vit_b.pth"],
+            "vit_l": ["sam_hq_vit_l.pth"],
+            "vit_h": ["sam_hq_vit_h.pth"],
+        }
+        for name in candidates.get(self.model_type, []):
             path = os.path.join(self.model_path, name)
             if os.path.exists(path):
+                self._validate_checkpoint_type(path)
                 return path
         for f in os.listdir(self.model_path):
             if f.endswith((".pt", ".pth")):
-                return os.path.join(self.model_path, f)
+                path = os.path.join(self.model_path, f)
+                self._validate_checkpoint_type(path)
+                return path
         raise FileNotFoundError(
             f"在 {self.model_path} 中未找到 SAM-HQ 模型文件"
+        )
+
+    def _validate_checkpoint_type(self, checkpoint: str):
+        """Fail fast before PyTorch emits a long shape-mismatch traceback."""
+        name = os.path.basename(checkpoint).lower()
+        for model_type in ("vit_b", "vit_l", "vit_h"):
+            if model_type in name and model_type != self.model_type:
+                raise ValueError(
+                    f"SAM-HQ 配置 model_type={self.model_type} 与权重文件不匹配: {name}"
+                )
+            if model_type in name and model_type == self.model_type:
+                return
+        raise ValueError(
+            f"无法从 SAM-HQ 权重文件名验证 model_type={self.model_type}: {name}；"
+            "请使用 sam_hq_vit_b/l/h.pth 命名"
         )
 
     def cleanup(self):
