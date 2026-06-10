@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+import torch
 
 
 class BaseSAMSession:
@@ -29,11 +30,14 @@ class BaseSAMSession:
         self._prev_npoints = 0
         self._cached_mask = None
         self._cached_logits = None
+        self._cached_generator = None
+        self._cached_generator_key = None
 
     def set_image(self, image: np.ndarray):
         self._original_size = image.shape[:2]
         self._original_image_rgb = image
-        self.predictor.set_image(image)
+        with torch.inference_mode():
+            self.predictor.set_image(image)
         self._image_set = True
         self._prev_logits = None
         self._prev_npoints = 0
@@ -47,8 +51,12 @@ class BaseSAMSession:
             raise RuntimeError("请先调用 set_image() 设置图像")
         if self.auto_mask_generator_cls is None:
             raise RuntimeError(f"{self.log_prefix} 未配置 auto_mask_generator_cls")
-        generator = self.auto_mask_generator_cls(self.model, **kwargs)
-        masks = generator.generate(self._original_image_rgb)
+        # Cache generator instance (avoids repeated construction overhead)
+        cache_key = tuple(sorted(kwargs.items())) if kwargs else ()
+        if self._cached_generator is None or self._cached_generator_key != cache_key:
+            self._cached_generator = self.auto_mask_generator_cls(self.model, **kwargs)
+            self._cached_generator_key = cache_key
+        masks = self._cached_generator.generate(self._original_image_rgb)
         masks.sort(key=lambda m: m["area"], reverse=True)
         print(f"[{self.log_prefix}] 自动分割完成, 发现 {len(masks)} 个主体")
         return masks
@@ -75,15 +83,16 @@ class BaseSAMSession:
             using_prev=using_prev,
         )
 
-        masks, scores, low_res = self.predictor.predict(
-            point_coords=coords,
-            point_labels=labels,
-            box=box_arr,
-            mask_input=mask_input,
-            multimask_output=single_pos_multimask,
-            return_logits=True,
-            **self.predict_kwargs,
-        )
+        with torch.inference_mode():
+            masks, scores, low_res = self.predictor.predict(
+                point_coords=coords,
+                point_labels=labels,
+                box=box_arr,
+                mask_input=mask_input,
+                multimask_output=single_pos_multimask,
+                return_logits=True,
+                **self.predict_kwargs,
+            )
         idx = int(scores.argmax()) if single_pos_multimask else 0
         self._prev_logits = low_res[idx]
         self._prev_npoints = len(point_coords)
@@ -159,14 +168,10 @@ class BaseSAMSession:
         opacity: float = 0.4,
     ) -> np.ndarray:
         mask = self.predict_mask(point_coords, point_labels, box=box)
-        overlay = image.copy().astype(np.float32)
-        color_array = np.array(mask_color, dtype=np.float32)
-        for c in range(3):
-            overlay[:, :, c] = np.where(
-                mask,
-                overlay[:, :, c] * (1 - opacity) + color_array[c] * opacity,
-                overlay[:, :, c],
-            )
+        darkened = cv2.addWeighted(image, 1.0 - opacity,
+                                   np.full_like(image, mask_color, dtype=np.uint8),
+                                   opacity, 0)
+        overlay = np.where(mask[..., None], darkened, image)
         return self._draw_points(overlay, point_coords, point_labels)
 
     def _draw_points(self, image: np.ndarray, point_coords: list, point_labels: list) -> np.ndarray:
@@ -183,5 +188,7 @@ class BaseSAMSession:
         self._original_size = None
         self._original_image_rgb = None
         self._cached_logits = None
+        self._cached_generator = None
+        self._cached_generator_key = None
         if self.predictor is not None:
             self.predictor.reset_image()

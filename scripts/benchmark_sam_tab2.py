@@ -222,6 +222,12 @@ def run_once(args, image: np.ndarray, engine_mode: str) -> dict[str, Any]:
     auto_choice_state = tab2_module._ensure_auto_choice({"selected": [], "excluded": []})
     auto_click_results = []
 
+    # Pre-compute base overlay to match real app behavior (cached across clicks)
+    base_overlay_time, base_overlay = _time_call(
+        lambda: tab2_module._build_auto_base_overlay(image, masks)
+    )
+    timings["auto_base_overlay_build"] = base_overlay_time
+
     for idx, point in enumerate(auto_points):
         def click_auto():
             return tab2_module.on_image_click(
@@ -233,6 +239,7 @@ def run_once(args, image: np.ndarray, engine_mode: str) -> dict[str, Any]:
                 labels_state,
                 box_state,
                 masks,
+                base_overlay,  # cached base overlay
                 auto_choice_state,
             )
 
@@ -290,6 +297,7 @@ def run_once(args, image: np.ndarray, engine_mode: str) -> dict[str, Any]:
                 labels_state,
                 box_state,
                 [],
+                None,  # auto_base_overlay_state
                 tab2_module._ensure_auto_choice({"selected": [], "excluded": []}),
             )
 

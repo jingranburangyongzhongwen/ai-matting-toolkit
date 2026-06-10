@@ -614,7 +614,7 @@ def build_tab1_ui():
                 )
                 comps["auto_result_img"] = gr.Image(
                     label="效果预览", interactive=False, visible=True,
-                    buttons=[], elem_classes="checkerboard",
+                    buttons=[], elem_classes="checkerboard", format="png",
                 )
                 comps["preview_actions"] = gr.Row(
                     elem_classes="preview-actions", visible=True,
@@ -758,7 +758,7 @@ def build_tab2_ui():
                 )
                 comps["result_img"] = gr.Image(
                     label="选区预览", interactive=False, buttons=[],
-                    elem_classes="checkerboard",
+                    elem_classes="checkerboard", format="png",
                 )
                 comps["canvas_preview_actions"] = gr.Row(
                     elem_classes="preview-actions", visible=True,
@@ -805,6 +805,8 @@ def build_tab2_ui():
         comps["labels_state"] = gr.State([])
         comps["box_state"] = gr.State(None)
         comps["auto_masks_state"] = gr.State([])
+        comps["auto_base_overlay_state"] = gr.State(None)
+        comps["image_id_state"] = gr.State(None)
         comps["auto_choice_state"] = gr.State(_ensure_auto_choice({"selected": [], "excluded": []}))
         comps["canvas_original_rgb_state"] = gr.State(None)
         comps["canvas_auto_rgba_state"] = gr.State(None)
