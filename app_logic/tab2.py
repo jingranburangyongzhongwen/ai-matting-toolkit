@@ -1141,7 +1141,7 @@ def on_image_click(image, evt: gr.SelectData, mode, engine_mode,
             overlay = _draw_auto_segment_overlay(image, auto_masks_state,
                                                  selected_idx=prev_indices or None)
             return (overlay, gr.update(visible=False), gr.update(value=None, visible=False),
-                    [], [], None, True, "未命中任何主体，请点击有色区域", None, None)
+                    [], [], None, True, "未命中任何主体，请点击有色区域", None, gr.update())
         if label_val == 1:
             new_indices = sorted(set(prev_indices) | set(hit_indices))
         else:
@@ -1149,7 +1149,7 @@ def on_image_click(image, evt: gr.SelectData, mode, engine_mode,
         if not new_indices:
             overlay = _draw_auto_segment_overlay(image, auto_masks_state)
             return (overlay, gr.update(visible=False), gr.update(value=None, visible=False),
-                    [], [], None, True, "已排除所有主体，请重新选取", None, None)
+                    [], [], None, True, "已排除所有主体，请重新选取", None, gr.update())
         merged_seg = _merge_auto_masks(auto_masks_state, new_indices)
         # 记录本次变更到模块级历史
         added_indices = sorted(set(new_indices) - set(prev_indices))
