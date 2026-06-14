@@ -281,12 +281,18 @@ def on_upload_mode_change(mode):
 
 # ── build_ui ────────────────────────────────────────────────────
 
-def build_ui(model_concurrency_limit=2):
+def build_ui(model_concurrency_limit=2, feedback_url=None):
     from app_ui.layout import build_tab1_ui, build_tab2_ui
     from app_ui.events import bind_tab1_events, bind_tab2_events
 
     with gr.Blocks(title="全自动抠图") as demo:
-        gr.Markdown("# 全自动抠图工具")
+        if feedback_url:
+            gr.Markdown(
+                f'# 全自动抠图工具　<a href="{feedback_url}" target="_blank" '
+                f'style="text-decoration:none;font-size:0.65em;">💬 反馈问题</a>'
+            )
+        else:
+            gr.Markdown("# 全自动抠图工具")
         # Ctrl+V 粘贴由前端 JS 实现：把剪贴板图片注入上传组件的
         # file input，复用 Gradio 原生上传流程（见 layout.APP_JS）
         tab1_comps = build_tab1_ui()
@@ -315,6 +321,7 @@ def _parse_cli_args():
     parser.add_argument("--queue-size", type=int, default=32, help="等待队列最大长度（默认 32）")
     parser.add_argument("--max-sam-sessions", type=int, default=8, help="多 session 时最多保留的 SAM 会话数")
     parser.add_argument("--multi-session", action="store_true", help="启用多人/多标签页隔离")
+    parser.add_argument("--feedback-url", type=str, default=None, help="反馈问题的超链接地址（显示在标题旁）")
     return parser.parse_args()
 
 
@@ -330,7 +337,7 @@ if __name__ == "__main__":
     )
     start_default_model_warmup()
     _startup_log("start warmup thread")
-    demo = build_ui(model_concurrency_limit=max(1, model_concurrency))
+    demo = build_ui(model_concurrency_limit=max(1, model_concurrency), feedback_url=args.feedback_url)
     _startup_log("warmup overlap checkpoint")
     _startup_log("build ui")
     demo.queue(
