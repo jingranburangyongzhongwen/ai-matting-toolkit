@@ -55,7 +55,7 @@ SCREEN_STRENGTH = 1.18
 SCREEN_MAX_STRENGTH = 0.98
 
 
-def _safe_norm(values: np.ndarray, axis: int = -1) -> np.ndarray:
+def _norm(values: np.ndarray, axis: int = -1) -> np.ndarray:
     return np.linalg.norm(values, axis=axis)
 
 
@@ -108,7 +108,7 @@ def _background_confidence(image: np.ndarray, alpha: np.ndarray,
     bg_var = _local_color_variance(rgb, bg_seed)
     var_conf = np.clip(1.0 - bg_var / BG_CONF_VARIANCE_WIDTH, 0.0, 1.0)
 
-    fill_error_map = _safe_norm(rgb - bg_fill, axis=2) / RGB_DISTANCE_MAX
+    fill_error_map = _norm(rgb - bg_fill, axis=2) / RGB_DISTANCE_MAX
     seed_error = np.zeros(alpha.shape, dtype=np.float32)
     seed_error[bg_seed] = fill_error_map[bg_seed]
     seed_fill_error = _neighbor_mean(seed_error[..., None], bg_seed, ksize=11)[..., 0]
@@ -245,7 +245,7 @@ def background_direction_defringe(image: np.ndarray, alpha: np.ndarray,
 
     delta = np.clip(projection, 0.0, 1.0)[..., None] * vector
     max_delta = np.where(high_alpha_mask | opaque_mask, MAX_RGB_DELTA_HIGH, MAX_RGB_DELTA_SOFT)
-    delta_norm = np.maximum(_safe_norm(delta, axis=2), 1e-6)
+    delta_norm = np.maximum(_norm(delta, axis=2), 1e-6)
     delta_scale = np.minimum(1.0, max_delta / delta_norm)
     cleaned = rgb - delta * delta_scale[..., None] * strength_map[..., None]
     cleaned = np.clip(cleaned, 0.0, 255.0)

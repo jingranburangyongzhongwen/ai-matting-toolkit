@@ -10,6 +10,9 @@ import numpy as np
 from PIL import Image
 
 from engines.rgb_defringe import background_direction_defringe
+from log import get_logger
+
+logger = get_logger(__name__)
 
 
 RGB_DISTANCE_MAX = float(np.sqrt(3.0) * 255.0)
@@ -677,116 +680,169 @@ def _dump_stats(profile: MatteProfile, width: Tuple[float, float],
     defringe_opaque = int(np.sum((strength > 0) & ctx["opaque_rim"]))
     defringe_solid = int(np.sum((strength > 0) & ctx["solid_rim"]))
     pct = lambda value: value * 100.0
-    print(
+    logger.debug(
         "[后处理诊断] Alpha分布: "
-        f"edge={pct(profile.edge_ratio):.2f}% haze={pct(profile.haze_ratio):.2f}% "
-        f"fringe={profile.fringe_pixels}px({pct(profile.fringe_ratio):.2f}%/edge) solid={profile.solid_area}px"
+        "edge=%.2f%% haze=%.2f%% "
+        "fringe=%spx(%.2f%%/edge) solid=%spx",
+        pct(profile.edge_ratio), pct(profile.haze_ratio),
+        profile.fringe_pixels, pct(profile.fringe_ratio), profile.solid_area
     )
-    print(
+    logger.debug(
         "[后处理诊断] 拓扑边缘: "
-        f"outer_fringe={profile.outer_fringe_pixels}px hole_fringe={profile.hole_fringe_pixels}px "
-        f"width_mean={width[0]:.2f}px width_p95={width[1]:.2f}px halo_score={profile.halo_score:.2f}"
+        "outer_fringe=%spx hole_fringe=%spx "
+        "width_mean=%.2fpx width_p95=%.2fpx halo_score=%.2f",
+        profile.outer_fringe_pixels, profile.hole_fringe_pixels,
+        width[0], width[1], profile.halo_score
     )
-    print(
+    logger.debug(
         "[后处理诊断] 边色污染: "
-        f"bright={profile.bright_fringe_score:.2f} dark={profile.dark_fringe_score:.2f} "
-        f"edge_bias={profile.defringe} strength_mean={strength_mean:.3f} strength_p95={strength_p95:.3f}"
+        "bright=%.2f dark=%.2f "
+        "edge_bias=%s strength_mean=%.3f strength_p95=%.3f",
+        profile.bright_fringe_score, profile.dark_fringe_score,
+        profile.defringe, strength_mean, strength_p95
     )
-    print(
+    logger.debug(
         "[postprocess diag] RGB recovery: "
-        f"method={metrics.get('method', 'background_direction_despill')} replace=background_direction "
-        f"scope=edge-only applied={active_pixels}px "
-        f"soft={metrics.get('soft_pixels', 0)}px "
-        f"high_alpha={metrics.get('high_alpha_pixels', 0)}px "
-        f"opaque={metrics.get('opaque_pixels', 0)}px "
-        f"screen={metrics.get('screen_pixels', 0)}px "
-        f"skip_bg={metrics.get('skipped_low_bg_conf', 0)}px "
-        f"skip_amb={metrics.get('skipped_ambiguous', 0)}px "
-        f"skip_proj={metrics.get('skipped_projection', 0)}px "
-        f"skip_protect={metrics.get('skipped_protected', 0)}px"
+        "method=%s replace=background_direction "
+        "scope=edge-only applied=%spx "
+        "soft=%spx "
+        "high_alpha=%spx "
+        "opaque=%spx "
+        "screen=%spx "
+        "skip_bg=%spx "
+        "skip_amb=%spx "
+        "skip_proj=%spx "
+        "skip_protect=%spx",
+        metrics.get('method', 'background_direction_despill'), active_pixels,
+        metrics.get('soft_pixels', 0),
+        metrics.get('high_alpha_pixels', 0),
+        metrics.get('opaque_pixels', 0),
+        metrics.get('screen_pixels', 0),
+        metrics.get('skipped_low_bg_conf', 0),
+        metrics.get('skipped_ambiguous', 0),
+        metrics.get('skipped_projection', 0),
+        metrics.get('skipped_protected', 0)
     )
-    print(
+    logger.debug(
         "[postprocess diag] BG confidence: "
-        f"seed={metrics.get('bg_seed_pixels', profile.bg_color_seed_pixels)}px "
-        f"near_edge={metrics.get('bg_seed_near_edge', 0.0) * 100.0:.2f}% "
-        f"conf={metrics.get('bg_conf_mean', 0.0):.3f}/"
-        f"{metrics.get('bg_conf_p10', 0.0):.3f}(mean/p10) "
-        f"var_p95={metrics.get('bg_var_p95', 0.0):.3f} "
-        f"fill_err_p95={metrics.get('bg_fill_error_p95', 0.0):.3f}"
+        "seed=%spx "
+        "near_edge=%.2f%% "
+        "conf=%.3f/"
+        "%.3f(mean/p10) "
+        "var_p95=%.3f "
+        "fill_err_p95=%.3f",
+        metrics.get('bg_seed_pixels', profile.bg_color_seed_pixels),
+        metrics.get('bg_seed_near_edge', 0.0) * 100.0,
+        metrics.get('bg_conf_mean', 0.0),
+        metrics.get('bg_conf_p10', 0.0),
+        metrics.get('bg_var_p95', 0.0),
+        metrics.get('bg_fill_error_p95', 0.0)
     )
-    print(
+    logger.debug(
         "[postprocess diag] Screen despill: "
-        f"green={metrics.get('screen_green_pixels', 0)}px "
-        f"blue={metrics.get('screen_blue_pixels', 0)}px "
-        f"strength={metrics.get('screen_strength_mean', 0.0):.3f}/"
-        f"{metrics.get('screen_strength_p95', 0.0):.3f}(mean/p95)"
+        "green=%spx "
+        "blue=%spx "
+        "strength=%.3f/"
+        "%.3f(mean/p95)",
+        metrics.get('screen_green_pixels', 0),
+        metrics.get('screen_blue_pixels', 0),
+        metrics.get('screen_strength_mean', 0.0),
+        metrics.get('screen_strength_p95', 0.0)
     )
-    print(
+    logger.debug(
         "[postprocess diag] Color model: "
-        f"safe_fg_seed={profile.safe_fg_seed_pixels}px bg_seed={profile.bg_color_seed_pixels}px "
-        f"spill_mean={profile.spill_score_mean:.3f} spill_p95={profile.spill_score_p95:.3f} "
-        f"opaque_rim={profile.opaque_rim_pixels}px({pct(profile.opaque_rim_ratio):.2f}%/color_fringe) "
-        f"solid_rim={profile.solid_rim_pixels}px"
+        "safe_fg_seed=%spx bg_seed=%spx "
+        "spill_mean=%.3f spill_p95=%.3f "
+        "opaque_rim=%spx(%.2f%%/color_fringe) "
+        "solid_rim=%spx",
+        profile.safe_fg_seed_pixels, profile.bg_color_seed_pixels,
+        profile.spill_score_mean, profile.spill_score_p95,
+        profile.opaque_rim_pixels, pct(profile.opaque_rim_ratio),
+        profile.solid_rim_pixels
     )
-    print(
+    logger.debug(
         "[postprocess diag] Defringe coverage: "
-        f"soft={defringe_soft}px opaque={defringe_opaque}px solid={defringe_solid}px "
-        f"total={active_pixels}px"
+        "soft=%spx opaque=%spx solid=%spx "
+        "total=%spx",
+        defringe_soft, defringe_opaque, defringe_solid,
+        active_pixels
     )
     if rgb_residue is not None:
         before = rgb_residue["before"]
         after = rgb_residue["after"]
-        print(
+        logger.debug(
             "[postprocess diag] RGB residue(final-alpha): "
-            f"pixels={after['pixels']} "
-            f"before_spill={before['spill_mean']:.3f}/{before['spill_p95']:.3f} "
-            f"after_spill={after['spill_mean']:.3f}/{after['spill_p95']:.3f} "
-            f"visible={before['visible_mean']:.3f}->{after['visible_mean']:.3f} "
-            f"p95={before['visible_p95']:.3f}->{after['visible_p95']:.3f} "
-            f"improve={pct(after['visible_improve']):.2f}%"
+            "pixels=%s "
+            "before_spill=%.3f/%.3f "
+            "after_spill=%.3f/%.3f "
+            "visible=%.3f->%.3f "
+            "p95=%.3f->%.3f "
+            "improve=%.2f%%",
+            after['pixels'],
+            before['spill_mean'], before['spill_p95'],
+            after['spill_mean'], after['spill_p95'],
+            before['visible_mean'], after['visible_mean'],
+            before['visible_p95'], after['visible_p95'],
+            pct(after['visible_improve'])
         )
         before_bins = metrics.get("residue_before_by_alpha", {})
         after_bins = metrics.get("residue_after_by_alpha", {})
-        print(
+        logger.debug(
             "[postprocess diag] RGB residue by alpha: "
-            f"<64={before_bins.get('lt64', 0.0):.3f}->{after_bins.get('lt64', 0.0):.3f} "
-            f"64-180={before_bins.get('64_180', 0.0):.3f}->{after_bins.get('64_180', 0.0):.3f} "
-            f"180-240={before_bins.get('180_240', 0.0):.3f}->{after_bins.get('180_240', 0.0):.3f} "
-            f">=240={before_bins.get('gte240', 0.0):.3f}->{after_bins.get('gte240', 0.0):.3f}"
+            "<64=%.3f->%.3f "
+            "64-180=%.3f->%.3f "
+            "180-240=%.3f->%.3f "
+            ">=240=%.3f->%.3f",
+            before_bins.get('lt64', 0.0), after_bins.get('lt64', 0.0),
+            before_bins.get('64_180', 0.0), after_bins.get('64_180', 0.0),
+            before_bins.get('180_240', 0.0), after_bins.get('180_240', 0.0),
+            before_bins.get('gte240', 0.0), after_bins.get('gte240', 0.0)
         )
-    print(
+    logger.debug(
         "[后处理诊断] 保护区域: "
-        f"detail={profile.detail_pixels}px({pct(profile.detail_ratio):.2f}%/edge) "
-        f"transparency={profile.protected_transparency_pixels}px({pct(profile.transparency_ratio):.2f}%/solid)"
+        "detail=%spx(%.2f%%/edge) "
+        "transparency=%spx(%.2f%%/solid)",
+        profile.detail_pixels, pct(profile.detail_ratio),
+        profile.protected_transparency_pixels, pct(profile.transparency_ratio)
     )
-    print(
+    logger.debug(
         "[后处理诊断] 后处理变化: "
-        f"alpha_area_loss={pct(guard['alpha_area_loss']):.2f}% "
-        f"solid_area_loss={pct(guard['solid_loss']):.2f}% "
-        f"alpha_l1_delta={guard['alpha_l1']:.4f} rollback={rollback}"
+        "alpha_area_loss=%.2f%% "
+        "solid_area_loss=%.2f%% "
+        "alpha_l1_delta=%.4f rollback=%s",
+        pct(guard['alpha_area_loss']),
+        pct(guard['solid_loss']),
+        guard['alpha_l1'], rollback
     )
-    print(
+    logger.debug(
         "[postprocess diag] Alpha delta: "
-        f"positive={guard['alpha_positive_pixels']}px negative={guard['alpha_negative_pixels']}px "
-        f"pos_l1={guard['alpha_positive_l1']:.4f} neg_l1={guard['alpha_negative_l1']:.4f} "
-        f"area_gain={pct(guard['alpha_area_gain']):.2f}% solid_gain={pct(guard['solid_gain']):.2f}%"
+        "positive=%spx negative=%spx "
+        "pos_l1=%.4f neg_l1=%.4f "
+        "area_gain=%.2f%% solid_gain=%.2f%%",
+        guard['alpha_positive_pixels'], guard['alpha_negative_pixels'],
+        guard['alpha_positive_l1'], guard['alpha_negative_l1'],
+        pct(guard['alpha_area_gain']), pct(guard['solid_gain'])
     )
-    print(
+    logger.debug(
         "[后处理诊断] 决策: "
-        f"profile={profile.profile} alpha_tighten={profile.alpha_tighten} edge_bias={profile.defringe}"
+        "profile=%s alpha_tighten=%s edge_bias=%s",
+        profile.profile, profile.alpha_tighten, profile.defringe
     )
     if alpha_before is not None:
         sb = _edge_smoothness(alpha_before, ctx)
-        print(
-            f"[后处理诊断] 边缘平滑: "
-            f"before lap_p95={sb['lap_p95']:.4f} smooth={sb['smooth_score']:.3f}"
+        logger.debug(
+            "[后处理诊断] 边缘平滑: "
+            "before lap_p95=%.4f smooth=%.3f",
+            sb['lap_p95'], sb['smooth_score']
         )
     if alpha_after is not None:
         sa = _edge_smoothness(alpha_after, ctx)
-        print(
-            f"[后处理诊断] 边缘平滑: "
-            f"after lap_p95={sa['lap_p95']:.4f} smooth={sa['smooth_score']:.3f} "
-            f"({'差' if sa['smooth_score'] > 0.6 else '中' if sa['smooth_score'] > 0.3 else '好'})"
+        logger.debug(
+            "[后处理诊断] 边缘平滑: "
+            "after lap_p95=%.4f smooth=%.3f "
+            "(%s)",
+            sa['lap_p95'], sa['smooth_score'],
+            ('差' if sa['smooth_score'] > 0.6 else '中' if sa['smooth_score'] > 0.3 else '好')
         )
 
 
@@ -895,6 +951,7 @@ def _clean_rgba_core(image_u8: np.ndarray, alpha_u8: np.ndarray, debug_dir: Opti
     )
     width = _edge_width(ctx) if debug_dir else (0.0, 0.0)
     alpha_refined = _refine_alpha(alpha_u8, ctx, profile)
+
     alpha_refined, rollback, guard = _guard_against_overcut(alpha_u8, alpha_refined, profile)
 
     # 复用首次 context：前景/背景色估计的 seed 取自稳定的实心核与背景，refine 仅收紧
@@ -913,22 +970,33 @@ def _clean_rgba_core(image_u8: np.ndarray, alpha_u8: np.ndarray, debug_dir: Opti
 
 def make_clean_rgba(image: np.ndarray, alpha: np.ndarray, debug_dir: Optional[str] = None,
                     preserve_transparency: bool = False) -> np.ndarray:
-    """Return RGBA using topology-aware alpha calibration and RGB decontamination."""
+    """Return RGBA using topology-aware alpha calibration and RGB decontamination.
+
+    Falls back to a simple RGBA composite (no post-processing) if the pipeline
+    raises an unexpected exception, so callers always get a usable result.
+    """
     import time
     t0 = time.perf_counter()
     image_u8 = np.clip(image, 0, 255).astype(np.uint8)
     alpha_u8 = np.clip(alpha, 0, 255).astype(np.uint8)
 
-    # debug 模式保持全图，保证诊断中间图与原图对齐。
-    crop = _foreground_crop(alpha_u8) if debug_dir is None else None
-    if crop is not None:
-        y1, y2, x1, x2 = crop
-        rgba_crop = _clean_rgba_core(image_u8[y1:y2, x1:x2], alpha_u8[y1:y2, x1:x2],
-                                     None, preserve_transparency)
-        rgba = np.zeros((*alpha_u8.shape, 4), dtype=np.uint8)
-        rgba[y1:y2, x1:x2] = rgba_crop
-    else:
-        rgba = _clean_rgba_core(image_u8, alpha_u8, debug_dir, preserve_transparency)
+    try:
+        # debug 模式保持全图，保证诊断中间图与原图对齐。
+        crop = _foreground_crop(alpha_u8) if debug_dir is None else None
+        if crop is not None:
+            y1, y2, x1, x2 = crop
+            rgba_crop = _clean_rgba_core(image_u8[y1:y2, x1:x2], alpha_u8[y1:y2, x1:x2],
+                                         None, preserve_transparency)
+            rgba = np.zeros((*alpha_u8.shape, 4), dtype=np.uint8)
+            rgba[y1:y2, x1:x2] = rgba_crop
+        else:
+            rgba = _clean_rgba_core(image_u8, alpha_u8, debug_dir, preserve_transparency)
 
-    print(f"[后处理] RGBA 后处理耗时 {time.perf_counter() - t0:.2f}s")
-    return rgba
+        logger.info("[后处理] RGBA 后处理耗时 %.2fs", time.perf_counter() - t0)
+        return rgba
+    except (MemoryError, ValueError, cv2.error) as exc:
+        logger.warning("[后处理] 管线异常 (%s)，回退到原始 alpha (无后处理)", type(exc).__name__,
+                       exc_info=True)
+        rgba = np.dstack([image_u8, alpha_u8])
+        logger.info("[后处理] 回退 RGBA 耗时 %.2fs", time.perf_counter() - t0)
+        return rgba

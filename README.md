@@ -191,8 +191,11 @@ ai-matting-toolkit/
 │   ├── sam_hq.py          # SAM-HQ
 │   └── grounding_dino.py  # 文本定位
 ├── scripts/
+│   ├── benchmark.py            # 端到端质量回归测试（Tab1 + Tab2 双引擎，含 LPIPS / SAD 等指标）
 │   ├── test_manual_refine.py   # 边缘修复回归测试
-│   └── verify_rgb_defringe.py  # RGB 去色边诊断（无需加载模型）
+│   ├── test_postprocess.py     # RGBA 后处理 + defringe 测试
+│   ├── test_rmbg_cleanup.py    # RMBG 连通域清理测试
+│   └── test_sam_strict_alpha.py# SAM strict alpha band 测试
 ├── models/                # 权重目录（见下文）
 ├── output/                # 导出 PNG 与可选 _debug 诊断
 └── build.bat              # PyInstaller 打包
@@ -214,10 +217,24 @@ pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 RGBA 后处理不依赖额外 matting solver；RGB 去色边基于 OpenCV/Numpy 的局部背景方向抑制。可不加载模型，先验证后处理诊断链路：
 
 ```bash
-python scripts/verify_rgb_defringe.py
+python scripts/test_postprocess.py
 ```
 
 边缘修复回归测试见上文「边缘修复」一节（需 ViTMatte，GPU 约 0.5s/case）。
+
+### 端到端质量回归测试
+
+改动代码后自动检测是否引入质量回归，覆盖 Tab1（RMBG-2.0）+ Tab2（MobileSAM + SAM-HQ）双引擎：
+
+```bash
+# 首次：准备测试图片目录（放几张代表性图片），保存基线
+python scripts/benchmark.py save --input test_images
+
+# 改动代码后：对比基线，自动报告回归
+python scripts/benchmark.py compare --input test_images
+```
+
+评测分层：模型输出（raw alpha 分布/边缘）→ 后处理效果（solid loss / 前景保留度）→ 最终输出（合成溢色检测）。只需 `test_images/` 下放原图，不需手动准备其他数据。
 
 ### 运行
 

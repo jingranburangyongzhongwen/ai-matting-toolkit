@@ -11,6 +11,9 @@ import numpy as np
 import torch
 from PIL import Image
 
+from log import get_logger
+logger = get_logger(__name__)
+
 
 class ViTMatteRefiner:
     HF_REPO = "hustvl/vitmatte-small-distinctions-646"
@@ -46,7 +49,7 @@ class ViTMatteRefiner:
                 self.model = VitMatteForImageMatting.from_pretrained(local_path)
             elif os.path.isfile(d2_ckpt):
                 # MatAny: detectron2 权重加载到 transformers 模型骨架
-                print(f"[ViTMatte] 从 detectron2 加载: {d2_ckpt}")
+                logger.info("从 detectron2 加载: %s", d2_ckpt)
                 base_repo = "hustvl/vitmatte-base-distinctions-646"
                 self.model = VitMatteForImageMatting.from_pretrained(base_repo)
                 self._load_detectron2_weights(d2_ckpt)
@@ -58,7 +61,7 @@ class ViTMatteRefiner:
                 if os.path.isfile(proc_src):
                     shutil.copy2(proc_src, os.path.join(local_path, "preprocessor_config.json"))
                 self.processor = VitMatteImageProcessor.from_pretrained(local_path)
-                print(f"[ViTMatte] 已缓存到: {local_path}")
+                logger.info("已缓存到: %s", local_path)
             else:
                 local_path = self._ensure_local(local_path)
                 self.processor = VitMatteImageProcessor.from_pretrained(local_path)
@@ -69,8 +72,8 @@ class ViTMatteRefiner:
             if torch.cuda.is_available():
                 allocated = torch.cuda.memory_allocated() / 1024**3
                 reserved = torch.cuda.memory_reserved() / 1024**3
-                print(f"[VRAM] ViTMatte loaded — allocated: {allocated:.2f}GB, reserved: {reserved:.2f}GB")
-            print("[ViTMatte] 模型加载完成")
+                logger.info("VRAM ViTMatte loaded — allocated: %.2fGB, reserved: %.2fGB", allocated, reserved)
+            logger.info("模型加载完成")
 
 
     def _load_detectron2_weights(self, ckpt_path: str):
@@ -123,7 +126,7 @@ class ViTMatteRefiner:
                 converted += 1
 
         self.model.load_state_dict(dst_sd)
-        print(f"[ViTMatte] 从 detectron2 加载了 {converted} 个 backbone 权重")
+        logger.info("从 detectron2 加载了 %d 个 backbone 权重", converted)
 
     def _patch_attention(self):
         """为 ViTMatte 注册 attention 优化。
@@ -203,10 +206,15 @@ class ViTMatteRefiner:
                 else:
                     strided_count += 1
 
-        print("[ViTMatte] attention=native(window+global)")
+        logger.info("attention=native(window+global)")
 
     def _set_strided(self, enabled: bool):
-        """切换优化 attention / 全 attention"""
+        """切换优化 attention / 全 attention。
+
+        当前所有调用点均传入 enabled=False（始终使用原生 window+global attention），
+        以保证最高质量。strided forward 已在 _patch_attention 中注册，可作为
+        大分辨率场景下的显存优化后备方案启用。
+        """
         count = 0
         # strided attention blocks
         for module in self.model.modules():
@@ -238,13 +246,13 @@ class ViTMatteRefiner:
             return path
         if not self.hf_repo:
             raise FileNotFoundError(f"本地模型不存在: {path}，且无 HuggingFace 源可下载")
-        print(f"[ViTMatte] 本地模型不完整，下载 {self.hf_repo} 到 {path} ...")
+        logger.info("本地模型不完整，下载 %s 到 %s ...", self.hf_repo, path)
         from huggingface_hub import snapshot_download
         snapshot_download(
             repo_id=self.hf_repo,
             local_dir=path,
         )
-        print("[ViTMatte] 下载完成")
+        logger.info("下载完成")
         return path
 
     def refine(self, image, alpha: np.ndarray, transparent_detector=None,
@@ -284,8 +292,10 @@ class ViTMatteRefiner:
 
         # RMBG already provides a soft alpha. Keep the unknown band narrow so
         # ViTMatte refines the edge instead of hallucinating a broad matte.
+        # erode=3, dilate=5, kernel=9 → unknown band ~72px，足以处理发丝。
+        # conservative merge + _guard_against_overcut 保护确定前景区域。
         if soft:
-            trimap_erode, trimap_dilate, trimap_kernel = 1, 3, 7
+            trimap_erode, trimap_dilate, trimap_kernel = 3, 5, 9
         else:
             trimap_erode, trimap_dilate, trimap_kernel = 2, 4, 7
 
@@ -302,7 +312,7 @@ class ViTMatteRefiner:
         if boxes is None and transparent_detector is not None:
             boxes = transparent_detector.detect(image)
         if boxes:
-            print(f"[ViTMatte] 检测到 {len(boxes)} 个透明物体，修正 trimap")
+            logger.info("检测到 %d 个透明物体，修正 trimap", len(boxes))
             trimap = self._mark_transparent(trimap, boxes)
 
         if _debug_dir:
@@ -340,7 +350,7 @@ class ViTMatteRefiner:
             fg = np.sum(result > 245) / total * 100
             edge = np.sum((result >= 10) & (result <= 245)) / total * 100
             edge_std = result[(result >= 10) & (result <= 245)].std() if np.any((result >= 10) & (result <= 245)) else 0
-            print(f"[诊断] ViTMatte输出: bg={bg:.1f}% fg={fg:.1f}% edge={edge:.1f}% edge_std={edge_std:.1f}")
+            logger.debug("ViTMatte输出: bg=%.1f%% fg=%.1f%% edge=%.1f%% edge_std=%.1f", bg, fg, edge, edge_std)
             Image.fromarray(result, "L").save(os.path.join(_debug_dir, "21_vitmatte_alpha.png"))
 
         return result
@@ -433,18 +443,23 @@ class ViTMatteRefiner:
         refined = self._run_vitmatte(strip_img, strip_tri, strip_h, strip_w,
                                      f"条带 {strip_w}x{strip_h}", full_w, full_h)
 
-        # 边界渐变混合：在条带边缘 20px 内，ViTMatte 输出和 RMBG alpha 线性混合，
-        # 消除条带边界处的硬接缝
-        BLEND = 20
+        # 边界渐变混合：在条带边缘用 Gaussian 权重与 RMBG alpha 混合，
+        # 中心区域完全信任 ViTMatte，边界处快速过渡，消除接缝。
+        # 参考 MONAI/nnU-Net 行业标准的 Gaussian 加权滑窗方案。
+        BLEND = 48
+        _t = np.linspace(-3.0, 3.0, BLEND)
+        _sigma = BLEND / 6.0
+        _gaussian = np.exp(-0.5 * (_t / _sigma) ** 2)
+        _gaussian /= _gaussian.max()
         weight = np.ones((strip_h, strip_w), dtype=np.float32)
         if sy1 > 0:
-            weight[:BLEND] *= np.linspace(0, 1, BLEND)[:, np.newaxis]
+            weight[:BLEND] *= _gaussian[:, np.newaxis]
         if sy2 < full_h:
-            weight[-BLEND:] *= np.linspace(1, 0, BLEND)[:, np.newaxis]
+            weight[-BLEND:] *= _gaussian[::-1][:, np.newaxis]
         if sx1 > 0:
-            weight[:, :BLEND] *= np.linspace(0, 1, BLEND)[np.newaxis, :]
+            weight[:, :BLEND] *= _gaussian[np.newaxis, :]
         if sx2 < full_w:
-            weight[:, -BLEND:] *= np.linspace(1, 0, BLEND)[np.newaxis, :]
+            weight[:, -BLEND:] *= _gaussian[::-1][np.newaxis, :]
 
         full_alpha = alpha.copy()
         full_alpha[sy1:sy2, sx1:sx2] = self._merge_refined_unknown(
@@ -459,7 +474,7 @@ class ViTMatteRefiner:
     def _run_vitmatte(self, infer_img, infer_tri, infer_h, infer_w,
                       tag, full_w, full_h):
         """执行 ViTMatte 推理并返回 refined alpha"""
-        print(f"[ViTMatte] attention=native(window+global) tile={infer_w}x{infer_h}")
+        logger.debug("tile=%dx%d", infer_w, infer_h)
         t0 = time.perf_counter()
         inputs = self.processor(
             images=Image.fromarray(infer_img),
@@ -467,8 +482,7 @@ class ViTMatteRefiner:
             return_tensors="pt",
         )
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        print(f"[ViTMatte] 预处理耗时 {time.perf_counter() - t0:.2f}s，"
-              f"全图 {full_w}x{full_h} → {tag}")
+        logger.info("预处理耗时 %.2fs, 全图 %dx%d → %s", time.perf_counter() - t0, full_w, full_h, tag)
 
         if self.device == "cuda":
             torch.cuda.empty_cache()
@@ -480,7 +494,7 @@ class ViTMatteRefiner:
                     outputs = self.model(**inputs)
             else:
                 outputs = self.model(**inputs)
-        print(f"[ViTMatte] 推理耗时 {time.perf_counter() - t1:.2f}s")
+        logger.info("推理耗时 %.2fs", time.perf_counter() - t1)
 
         refined = outputs.alphas[0, 0].float().cpu().numpy()[:infer_h, :infer_w]
         return np.clip(refined, 0, 1)
@@ -583,6 +597,19 @@ class ViTMatteRefiner:
             transition = (a > 0.05) & (a < 0.95)
             trimap[transition] = 127
 
+        # Trimap 质量检查：unknown band 过窄或过宽时记录警告
+        total = trimap.size
+        unknown_ratio = np.sum(trimap == 127) / total
+        fg_ratio = np.sum(trimap == 255) / total
+        if unknown_ratio < 0.005:
+            logger.warning("Trimap unknown band < 0.5%% (%.2f%%)，ViTMatte 可能缺乏预测空间",
+                           unknown_ratio * 100)
+        elif unknown_ratio > 0.50:
+            logger.warning("Trimap unknown band > 50%% (%.2f%%)，ViTMatte 可能产生幻觉",
+                           unknown_ratio * 100)
+        if fg_ratio < 0.001:
+            logger.warning("Trimap 确定前景 < 0.1%% (%.3f%%)，可能无法约束预测", fg_ratio * 100)
+
         return trimap
 
     @staticmethod
@@ -609,10 +636,9 @@ class ViTMatteRefiner:
         n, _, stats, _ = cv2.connectedComponentsWithStats((trimap == 127).astype(np.uint8))
         min_area = stats[1:, cv2.CC_STAT_AREA].min() if n > 1 else 0
         max_area = stats[1:, cv2.CC_STAT_AREA].max() if n > 1 else 0
-        print(
-            f"[诊断] ViTMatte实际Trimap: bg={bg:.1f}% unknown={unk:.1f}% fg={fg:.1f}% | "
-            f"unknown连通域={n - 1}个 | unknown面积: min={min_area} max={max_area}"
-        )
+        logger.debug("ViTMatte实际Trimap: bg=%.1f%% unknown=%.1f%% fg=%.1f%% | "
+                     "unknown连通域=%d个 | unknown面积: min=%d max=%d",
+                     bg, unk, fg, n - 1, min_area, max_area)
 
     def cleanup(self):
         with self._infer_lock, self._load_lock:

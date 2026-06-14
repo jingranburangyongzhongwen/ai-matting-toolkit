@@ -1,6 +1,10 @@
 # ── 入口：初始化 + Tab1 回调 + UI 构建 + CLI ─────────────────────
 import argparse, gc, os, signal, time, threading, warnings
 
+from log import get_logger
+
+logger = get_logger(__name__)
+
 _STARTUP_T0 = time.perf_counter()
 _STARTUP_LAST = _STARTUP_T0
 _DEFAULT_WARMUP_THREAD = None
@@ -11,10 +15,7 @@ def _startup_log(stage: str):
     if os.environ.get("MATTING_STARTUP_LOG", "1") == "0":
         return
     now = time.perf_counter()
-    print(
-        f"[startup] {stage}: +{now - _STARTUP_LAST:.2f}s "
-        f"(total {now - _STARTUP_T0:.2f}s)"
-    )
+    logger.info("startup %s: +%.2fs (total %.2fs)", stage, now - _STARTUP_LAST, now - _STARTUP_T0)
     _STARTUP_LAST = now
 
 
@@ -65,9 +66,9 @@ def start_default_model_warmup():
         t0 = time.perf_counter()
         try:
             mgr.preload_rmbg2()
-            print(f"[startup warmup] RMBG-2.0 ready in {time.perf_counter() - t0:.2f}s")
+            logger.info("warmup RMBG-2.0 ready in %.2fs", time.perf_counter() - t0)
         except Exception as exc:
-            print(f"[startup warmup] RMBG-2.0 failed: {exc}")
+            logger.warning("warmup RMBG-2.0 failed: %s", exc)
 
     _DEFAULT_WARMUP_THREAD = threading.Thread(
         target=_worker, name="rmbg2-warmup", daemon=True
@@ -94,6 +95,7 @@ def on_auto_process(files, single_img, source_img, detect_transparent, vitmatte_
            gr.update(), gr.update(), gr.update(), gr.update(visible=False))
 
     # 统一文件列表：单张模式从 numpy 保存临时文件，批量模式直接用文件列表
+    _tmp_file = None
     if single_img is not None:
         import tempfile
         img_arr = np.asarray(single_img)
@@ -102,8 +104,13 @@ def on_auto_process(files, single_img, source_img, detect_transparent, vitmatte_
         elif img_arr.shape[2] == 4:
             img_arr = img_arr[:, :, :3]
         tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-        Image.fromarray(img_arr).save(tmp.name)
-        files = [tmp.name]
+        try:
+            Image.fromarray(img_arr).save(tmp.name)
+            files = [tmp.name]
+            _tmp_file = tmp.name
+        except Exception:
+            os.unlink(tmp.name)
+            raise
     if not files:
         yield (gr.update(), "请先上传图片", None, gr.update(visible=False), gr.update(visible=False),
                gr.update(), gr.update(), gr.update(), gr.update(visible=False))
@@ -172,22 +179,29 @@ def on_auto_process(files, single_img, source_img, detect_transparent, vitmatte_
         last_original = np.array(img)
         yield last_original, f"[{idx + 1}/{total}] RMBG-2.0 推理中: {fname}", gr.update(), gr.update(visible=(last_result is not None)), gr.update(visible=(last_result is not None)), gr.update(), gr.update(), gr.update(), gr.update(visible=False)
 
-        result = mgr.rmbg2.remove_background(
-            img, refiner=refiner, transparent_detector=detector,
-            refine_mode=refine_mode, debug_dir=debug_dir,
-        )
+        try:
+            result = mgr.rmbg2.remove_background(
+                img, refiner=refiner, transparent_detector=detector,
+                refine_mode=refine_mode, debug_dir=debug_dir,
+            )
 
-        result.save(out_path)
+            result.save(out_path)
 
-        last_result = out_path
-        rgba_arr = np.array(result) if isinstance(result, Image.Image) else result
-        if rgba_arr.ndim == 3 and rgba_arr.shape[2] == 4:
-            yield (gr.update(), f"[{idx + 1}/{total}] 完成: {fname} → {os.path.basename(out_path)}",
-                   result, gr.update(visible=True), gr.update(value=out_path, visible=True),
-                   last_original, rgba_arr, rgba_arr, gr.update(visible=True))
-        else:
-            yield (gr.update(), f"[{idx + 1}/{total}] 完成: {fname} → {os.path.basename(out_path)}",
-                   result, gr.update(visible=True), gr.update(value=out_path, visible=True),
+            last_result = out_path
+            rgba_arr = np.array(result) if isinstance(result, Image.Image) else result
+            if rgba_arr.ndim == 3 and rgba_arr.shape[2] == 4:
+                yield (gr.update(), f"[{idx + 1}/{total}] 完成: {fname} → {os.path.basename(out_path)}",
+                       result, gr.update(visible=True), gr.update(value=out_path, visible=True),
+                       last_original, rgba_arr, rgba_arr, gr.update(visible=True))
+            else:
+                yield (gr.update(), f"[{idx + 1}/{total}] 完成: {fname} → {os.path.basename(out_path)}",
+                       result, gr.update(visible=True), gr.update(value=out_path, visible=True),
+                       gr.update(), gr.update(), gr.update(), gr.update(visible=False))
+        except Exception as e:
+            logger.warning("[%d/%d] 处理失败: %s — %s", idx + 1, total, fname, e)
+            yield (gr.update(), f"[{idx + 1}/{total}] 处理失败: {fname}，已跳过",
+                   gr.update(), gr.update(visible=(last_result is not None)),
+                   gr.update(visible=(last_result is not None)),
                    gr.update(), gr.update(), gr.update(), gr.update(visible=False))
 
         del img
@@ -198,6 +212,12 @@ def on_auto_process(files, single_img, source_img, detect_transparent, vitmatte_
         yield gr.update(), f"全部完成，共处理 {total} 张，结果保存在 output/", gr.update(), gr.update(visible=True), gr.update(visible=True), gr.update(), gr.update(), gr.update(), gr.update(visible=True)
     else:
         yield gr.update(), "没有有效图片被处理", gr.update(), gr.update(visible=False), gr.update(visible=False), gr.update(), gr.update(), gr.update(), gr.update(visible=False)
+
+    if _tmp_file is not None:
+        try:
+            os.unlink(_tmp_file)
+        except OSError:
+            pass
 
 
 def on_auto_upload(image):
