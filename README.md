@@ -190,7 +190,8 @@ ai-matting-toolkit/
 │   └── test_sam_strict_alpha.py# SAM strict alpha band 测试
 ├── models/                # 权重目录（见下文）
 ├── output/                # 导出 PNG 与可选 _debug 诊断
-└── build.bat              # PyInstaller 打包
+├── build.py               # PyInstaller 打包（跨平台 Python 入口）
+├── _build_spec.py         # 动态生成优化 .spec 文件
 ```
 
 ## 开发环境
@@ -321,12 +322,13 @@ curl -L -o models/mobile_sam/mobile_sam.pt https://ghproxy.com/https://github.co
 ### 打包为 exe
 
 ```bash
-build.bat
+python build.py
+python build.py --no-models    # 跳过模型复制，快速迭代
 ```
 
 产物目录：`dist/全自动抠图/`（`全自动抠图.exe` + `_internal/` + 可选 `models/`）。PyInstaller 缓存写在 `.pyi-build/`，结束后自动清理。若被杀毒拦截，将整个 `dist/全自动抠图/` 文件夹加入白名单。
 
-`pyinstaller-hooks/hook-kornia.py` 将 kornia 以源码打入包内，避免 exe 中 `torch.jit.script` 因缺源码失败。
+`pyinstaller-hooks/` 下的自定义 hook 将 `torchvision`、`mobile_sam`、`segment_anything_hq`、`kornia` 以 `pyz+py` 模式打入包内，保留 `.py` 源码供 `torch.load` / `torch.jit.script` 反序列化使用。
 
 ## 技术栈
 
