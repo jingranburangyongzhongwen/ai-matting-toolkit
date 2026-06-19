@@ -73,6 +73,44 @@ def python_output(code: str) -> str | None:
     return None
 
 
+def _load_transformers_submodules() -> list[str]:
+    """从 pyinstaller-hooks/_transformers_modules.py 读取 SUBMODULES 列表。
+
+    作为单一数据源，避免在 build.py / hook / runtime_hook 三处维护同一份清单。
+    """
+    import ast
+
+    shared = os.path.join(SCRIPT_DIR, "pyinstaller-hooks", "_transformers_modules.py")
+    if not os.path.isfile(shared):
+        warn(f"未找到 {shared}，transformers hidden-import 将使用精简列表")
+        return ["transformers", "transformers.models"]
+
+    with open(shared, encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+
+    for node in ast.walk(tree):
+        # SUBMODULES = [...] 或 SUBMODULES: list[str] = [...]
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+            value = node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            targets = [node.target]
+            value = node.value
+        else:
+            continue
+
+        for target in targets:
+            if isinstance(target, ast.Name) and target.id == "SUBMODULES" and isinstance(value, ast.List):
+                return [
+                    elt.value
+                    for elt in value.elts
+                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
+                ]
+
+    warn("_transformers_modules.py 中未找到 SUBMODULES 定义")
+    return ["transformers", "transformers.models"]
+
+
 # ── 环境检测 ──────────────────────────────────────────────────────────────────
 def check_environment() -> tuple[str, str]:
     """检查 Python / PyInstaller / Gradio 是否就绪，返回 (gradio_path, safehttpx_path)。"""
@@ -160,9 +198,62 @@ def post_build(dist_dir: str, app_name: str, safehttpx_path: str, copy_models: b
             info("已复制 models 到分发目录")
         else:
             warn("未找到 models/ 目录，请手动复制到 dist/<app_name>/models/")
+    else:
+        # --no-models 模式：清除上次构建残留的 models 目录
+        stale = os.path.join(app_dir, "models")
+        if os.path.isdir(stale):
+            shutil.rmtree(stale)
+            info("已清除残留的 models/ 目录")
 
 
 # ── 主流程 ────────────────────────────────────────────────────────────────────
+
+def _patch_transformers_auto_docstring() -> str | None:
+    """临时修复 transformers auto_docstring 在 PyInstaller 冻结环境中的 IndexError。
+
+    auto_docstring.get_model_name() 假设路径至少有 3 层目录（.../models/{m}/...），
+    但在 PyInstaller 中路径可能更短，导致 path.split(sep)[-3] 越界。
+    返回原始内容（用于恢复），如果无需修补则返回 None。
+    """
+    import importlib.util
+    spec = importlib.util.find_spec("transformers.utils.auto_docstring")
+    if spec is None or spec.origin is None:
+        return None
+    fpath = spec.origin
+    with open(fpath, encoding="utf-8") as f:
+        content = f.read()
+    old_line = '    if path.split(os.path.sep)[-3] != "models":'
+    new_line = '    if len(path.split(os.path.sep)) < 3 or path.split(os.path.sep)[-3] != "models":'
+    if old_line not in content:
+        error(
+            f"无法匹配 auto_docstring 目标代码行，transformers 版本可能已变化。\n"
+            f"  文件: {fpath}\n"
+            f"  请检查 get_model_name() 是否仍包含以下代码:\n"
+            f"  {old_line.strip()}"
+        )
+        sys.exit(1)
+    info("临时修补 transformers auto_docstring.get_model_name() ...")
+    patched = content.replace(old_line, new_line, 1)
+    try:
+        with open(fpath, "w", encoding="utf-8") as f:
+            f.write(patched)
+    except OSError as exc:
+        error(f"无法写入 {fpath}: {exc}")
+        sys.exit(1)
+    return content
+
+
+def _restore_transformers_auto_docstring(original: str) -> None:
+    """恢复 transformers auto_docstring 的原始内容。"""
+    import importlib.util
+    spec = importlib.util.find_spec("transformers.utils.auto_docstring")
+    if spec is None or spec.origin is None:
+        return
+    with open(spec.origin, "w", encoding="utf-8") as f:
+        f.write(original)
+    info("已恢复 transformers auto_docstring")
+
+
 def build(app_name: str, copy_models: bool) -> None:
     t0 = time.monotonic()
     gradio_path, safehttpx_path = check_environment()
@@ -179,6 +270,12 @@ def build(app_name: str, copy_models: bool) -> None:
     rmtree_safe(work_dir)
     os.makedirs(work_dir, exist_ok=True)
 
+    # 从共享清单加载 transformers 子模块（单一数据源，避免三处漂移）
+    _tf_submodules = _load_transformers_submodules()
+    _tf_hidden_imports = []
+    for _mod in ["transformers", "transformers.models"] + _tf_submodules:
+        _tf_hidden_imports += ["--hidden-import", _mod]
+
     # 构建 PyInstaller 参数
     cmd = [
         sys.executable, "-m", "PyInstaller",
@@ -193,15 +290,17 @@ def build(app_name: str, copy_models: bool) -> None:
         "--add-data", f"README.md{SEP}.",
         # 自定义 hook
         "--additional-hooks-dir", os.path.join(SCRIPT_DIR, "pyinstaller-hooks"),
+        "--runtime-hook", os.path.join(SCRIPT_DIR, "pyinstaller-hooks", "runtime_transformers.py"),
         # 子模块收集
         "--collect-submodules", "engines",
         "--collect-submodules", "kornia",
         # 隐藏导入
         "--hidden-import", "torch",
         "--hidden-import", "torchvision",
-        "--hidden-import", "transformers",
+    ] + _tf_hidden_imports + [
         "--hidden-import", "safetensors",
         "--hidden-import", "timm",
+        "--hidden-import", "tqdm",
         "--hidden-import", "cv2",
         "--hidden-import", "PIL",
         "--hidden-import", "numpy",
@@ -229,6 +328,20 @@ def build(app_name: str, copy_models: bool) -> None:
         "--collect-all", "gradio",
         "--collect-data", "safehttpx",
         "--collect-data", "groovy",
+        # transformers 的 dependency_versions_check 在运行时通过 importlib.metadata 检查这些包的版本，
+        # 需要将 .dist-info 元数据复制到打包产物中
+        "--copy-metadata", "tqdm",
+        "--copy-metadata", "regex",
+        "--copy-metadata", "requests",
+        "--copy-metadata", "packaging",
+        "--copy-metadata", "filelock",
+        "--copy-metadata", "numpy",
+        "--copy-metadata", "huggingface-hub",
+        "--copy-metadata", "safetensors",
+        "--copy-metadata", "pyyaml",
+        "--copy-metadata", "tokenizers",
+        "--copy-metadata", "accelerate",
+        "--copy-metadata", "torchcodec",
         # 排除不需要的包（避免 Qt 冲突 / skimage 子进程崩溃）
         "--exclude-module", "PySide6",
         "--exclude-module", "PyQt5",
@@ -238,7 +351,15 @@ def build(app_name: str, copy_models: bool) -> None:
         "app.py",
     ]
 
-    exit_code = run(cmd)
+    # 临时修补 transformers auto_docstring，修复 PyInstaller 冻结环境中的 IndexError
+    _ad_original = None
+    try:
+        _ad_original = _patch_transformers_auto_docstring()
+        exit_code = run(cmd)
+    finally:
+        # 无论成功失败都恢复原始文件
+        if _ad_original is not None:
+            _restore_transformers_auto_docstring(_ad_original)
 
     # 无论成功失败都清理临时产物
     cleanup(work_dir, dist_dir, app_name)
