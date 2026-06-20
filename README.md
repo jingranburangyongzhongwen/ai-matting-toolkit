@@ -324,9 +324,10 @@ curl -L -o models/mobile_sam/mobile_sam.pt https://ghproxy.com/https://github.co
 ```bash
 python build.py
 python build.py --no-models    # 跳过模型复制，快速迭代
+python build.py --clean        # 构建前强制清理旧中间目录
 ```
 
-产物目录：`dist/全自动抠图/`（`全自动抠图.exe` + `_internal/` + 可选 `models/`）。PyInstaller 缓存写在 `.pyi-build/`，结束后自动清理。若被杀毒拦截，将整个 `dist/全自动抠图/` 文件夹加入白名单。
+产物目录：`dist/全自动抠图/`（`全自动抠图.exe` + `_internal/` + 可选 `models/`）。默认保留 PyInstaller 中间目录以加速增量打包，构建成功后自动清理、失败时保留以便排查；`--clean` 可在构建前强制清理。若被杀毒拦截，将整个 `dist/全自动抠图/` 文件夹加入白名单。
 
 `pyinstaller-hooks/` 下的自定义 hook 将 `torchvision`、`mobile_sam`、`segment_anything_hq`、`kornia` 以 `pyz+py` 模式打入包内，保留 `.py` 源码供 `torch.load` / `torch.jit.script` 反序列化使用。
 
