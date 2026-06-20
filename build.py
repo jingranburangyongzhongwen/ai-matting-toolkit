@@ -2,9 +2,10 @@
 """跨平台 PyInstaller 打包脚本 —— 替代 build.bat
 
 用法:
-    python build.py              # 默认打包
+    python build.py              # 默认打包（构建成功后自动清理中间目录）
     python build.py --no-models  # 不复制 models（用于调试）
     python build.py --name MyApp # 自定义产物名称
+    python build.py --clean      # 构建前强制清理旧的中间目录
 """
 import argparse
 import glob
@@ -151,26 +152,51 @@ def check_environment() -> tuple[str, str]:
 
 
 # ── 清理函数 ──────────────────────────────────────────────────────────────────
-def cleanup(work_dir: str, dist_dir: str, app_name: str) -> None:
-    """清理所有打包临时产物，保留最终 dist 目录。"""
-    info("清理临时文件...")
-    rmtree_safe(work_dir)
-    rmtree_safe(os.path.join(SCRIPT_DIR, "build"))
-    rm_safe(os.path.join(SCRIPT_DIR, f"{app_name}.spec"))
-
-    # 也清理 __pycache__ 中可能残留的打包缓存
-    for pycache in glob.glob(os.path.join(SCRIPT_DIR, "**", "__pycache__"), recursive=True):
-        # 只删 PyInstaller 中间产物，不动项目本身的 __pycache__
-        pass  # 保留项目 __pycache__，避免影响开发
-
-    info("临时文件已清理")
+def cleanup(work_dir: str, dist_dir: str, app_name: str, clean: bool = False) -> None:
+    """清理打包临时产物，保留最终 dist 目录。"""
+    if clean:
+        info("清理临时文件...")
+        rmtree_safe(work_dir)
+        rmtree_safe(os.path.join(SCRIPT_DIR, "build"))
+        rm_safe(os.path.join(SCRIPT_DIR, f"{app_name}.spec"))
+        info("临时文件已清理")
+    else:
+        info("跳过临时目录清理（使用 --clean 可强制清理）")
 
 
 # ── 后处理 ────────────────────────────────────────────────────────────────────
+
+
+
+def _fast_copytree(src: str, dst: str) -> None:
+    """用系统 robocopy 复制目录（Windows 多线程，比 shutil.copytree 快 2-3x）。"""
+    if os.path.isdir(dst):
+        shutil.rmtree(dst)
+    if sys.platform == "win32":
+        info("使用 robocopy 多线程复制...")
+        # /E 递归 /MT:16 16线程 /NFL /NDL /NJH /NJS 去掉日志噪音
+        result = subprocess.run(
+            ["robocopy", src, dst, "/E", "/MT:16", "/NFL", "/NDL", "/NJH", "/NJS"],
+            capture_output=True, text=True,
+        )
+        # robocopy 退出码 0-7 表示成功
+        if result.returncode > 7:
+            raise RuntimeError(f"robocopy 失败，退出码 {result.returncode}: {result.stderr}")
+    else:
+        shutil.copytree(src, dst)
+
+
 def post_build(dist_dir: str, app_name: str, safehttpx_path: str, copy_models: bool) -> None:
     """PyInstaller 结束后的收尾工作。"""
     app_dir = os.path.join(dist_dir, app_name)
     internal_dir = os.path.join(app_dir, "_internal")
+
+    # 0. CUDA DLL 清理 — 已禁用
+    # 2026-06-20: PE 导入表分析确认 torch_cuda.dll 静态依赖 cufft64_11.dll，
+    # 删除后 Windows DLL 加载器无法解析 → import torch 崩溃。
+    # 其余 5 个（cusolverMg / curand / nvrtc.alt / cudnn_heuristic / cufftw）
+    # 虽无静态依赖，但可能被 CUDA 运行时 / cuDNN 动态 LoadLibrary，风险不值得省 ~800 MB。
+    # _clean_torch_cuda_dlls(internal_dir)
 
     # 1. safehttpx / groovy version.txt 兜底复制（collect-data 偶发漏打）
     for pkg_name, pkg_path in [("safehttpx", safehttpx_path), ("groovy", "")]:
@@ -192,9 +218,7 @@ def post_build(dist_dir: str, app_name: str, safehttpx_path: str, copy_models: b
         models_src = os.path.join(SCRIPT_DIR, "models")
         if os.path.isdir(models_src):
             models_dst = os.path.join(app_dir, "models")
-            if os.path.isdir(models_dst):
-                shutil.rmtree(models_dst)
-            shutil.copytree(models_src, models_dst)
+            _fast_copytree(models_src, models_dst)
             info("已复制 models 到分发目录")
         else:
             warn("未找到 models/ 目录，请手动复制到 dist/<app_name>/models/")
@@ -254,7 +278,7 @@ def _restore_transformers_auto_docstring(original: str) -> None:
     info("已恢复 transformers auto_docstring")
 
 
-def build(app_name: str, copy_models: bool) -> None:
+def build(app_name: str, copy_models: bool, clean: bool = False) -> None:
     t0 = time.monotonic()
     gradio_path, safehttpx_path = check_environment()
 
@@ -266,8 +290,9 @@ def build(app_name: str, copy_models: bool) -> None:
     info(f"输出目录: {dist_dir}")
     info("开始打包...")
 
-    # 清理旧的中间目录
-    rmtree_safe(work_dir)
+    # 清理旧的中间目录（仅在 --clean 时执行）
+    if clean:
+        rmtree_safe(work_dir)
     os.makedirs(work_dir, exist_ok=True)
 
     # 从共享清单加载 transformers 子模块（单一数据源，避免三处漂移）
@@ -283,6 +308,7 @@ def build(app_name: str, copy_models: bool) -> None:
         "--workpath", work_dir,
         "--distpath", dist_dir,
         "--onedir",
+        "--noupx",  # 禁用 UPX 压缩，避免大型 DLL 压缩耗时和运行时解压开销
         "--name", app_name,
         # 数据文件
         "--add-data", f"engines{SEP}engines",
@@ -347,6 +373,32 @@ def build(app_name: str, copy_models: bool) -> None:
         "--exclude-module", "PyQt5",
         "--exclude-module", "PyQt6",
         "--exclude-module", "skimage",
+        # Gradio 传递依赖（本应用不使用）
+        "--exclude-module", "panel",           # 108 MB
+        "--exclude-module", "bokeh",           # 32 MB
+        "--exclude-module", "notebook",        # 63 MB
+        "--exclude-module", "jupyterlab",      # 21 MB
+        "--exclude-module", "ipykernel",
+        "--exclude-module", "IPython",
+        # huggingface_hub AWS 依赖（离线推理不需要）
+        "--exclude-module", "botocore",        # 106 MB
+        "--exclude-module", "boto3",
+        # 数据科学栈（本应用不使用）
+        "--exclude-module", "pyarrow",         # 18 MB
+        "--exclude-module", "sklearn",         # 15 MB
+        "--exclude-module", "scipy",           # 35 MB
+        "--exclude-module", "dask",
+        "--exclude-module", "distributed",
+        # 其他不需要的
+        "--exclude-module", "llvmlite",        # 88 MB
+        "--exclude-module", "av",              # 65 MB
+        "--exclude-module", "torchaudio",      # 11 MB
+        "--exclude-module", "matplotlib",      # 12 MB
+        "--exclude-module", "plotly",          # 13 MB
+        "--exclude-module", "sphinx",          # 11 MB
+        "--exclude-module", "nltk",            # 15 MB
+        "--exclude-module", "statsmodels",     # 7.5 MB
+        "--exclude-module", "onnxruntime",     # 33 MB
         # 入口
         "app.py",
     ]
@@ -361,8 +413,8 @@ def build(app_name: str, copy_models: bool) -> None:
         if _ad_original is not None:
             _restore_transformers_auto_docstring(_ad_original)
 
-    # 无论成功失败都清理临时产物
-    cleanup(work_dir, dist_dir, app_name)
+    # 无论成功失败都清理临时产物（打包成功时删除中间目录释放空间，失败时保留以便排查）
+    cleanup(work_dir, dist_dir, app_name, clean=(exit_code == 0))
 
     if exit_code != 0:
         error("打包失败，请检查上方错误信息")
@@ -407,8 +459,12 @@ def main() -> None:
         "--no-models", action="store_true",
         help="不复制 models 目录到产物中（用于调试打包流程）",
     )
+    parser.add_argument(
+        "--clean", action="store_true",
+        help="构建前强制清理旧的中间目录（默认保留以加速增量打包；构建成功后自动清理）",
+    )
     args = parser.parse_args()
-    build(app_name=args.name, copy_models=not args.no_models)
+    build(app_name=args.name, copy_models=not args.no_models, clean=args.clean)
 
 
 if __name__ == "__main__":
