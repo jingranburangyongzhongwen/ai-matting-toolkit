@@ -2,6 +2,7 @@
 import hashlib
 import os
 import threading
+import time
 from collections import OrderedDict
 
 import cv2
@@ -9,9 +10,13 @@ import gradio as gr
 import numpy as np
 from PIL import Image
 
+from log import get_logger
 from model_manager import free_vram_gb, get_output_path
 
+logger = get_logger(__name__)
+
 # ── 模块级状态 ───────────────────────────────────────────────────
+import uuid as _uuid
 _mgr = None
 
 KEEP_RESIDENT_FREE_GB = 6.0
@@ -20,9 +25,11 @@ _SAM_CONTEXTS = OrderedDict()
 _STALE_SAM_ACTIVE = {}
 _MULTI_SESSION_MODE = False
 _MAX_SAM_CONTEXTS = 1
+# 自动分割选择历史（替代 gr.State 跨事件传递）
+_SELECT_HISTORY = {}
 ENGINE_MODE_MAP = {"快速": "mobile_sam", "高精度": "sam_hq"}
 TAB2_OUTPUT_MODES = {"SAM严格": "sam_strict", "RMBG精修": "rmbg_refine"}
-AUTO_SEGMENT_MAX_MASKS = 80
+AUTO_SEGMENT_MAX_MASKS = 120
 _AGGRESSIVE_UNLOAD_ENV = os.environ.get("MATTING_AGGRESSIVE_UNLOAD")
 _AGGRESSIVE_UNLOAD = (
     _AGGRESSIVE_UNLOAD_ENV == "1"
@@ -48,10 +55,8 @@ def configure_runtime(multi_session: bool, max_sam_sessions: int):
     _mgr.set_multi_session_mode(_MULTI_SESSION_MODE)
     _set_max_sam_contexts(max_sam_sessions if _MULTI_SESSION_MODE else 1)
     mode = "multi-session" if _MULTI_SESSION_MODE else "single-session"
-    print(
-        f"[runtime] mode={mode}, max_sam_sessions={_MAX_SAM_CONTEXTS}, "
-        f"aggressive_unload={_AGGRESSIVE_UNLOAD}"
-    )
+    logger.info("runtime mode=%s, max_sam_sessions=%d, aggressive_unload=%s",
+                mode, _MAX_SAM_CONTEXTS, _AGGRESSIVE_UNLOAD)
 
 
 def _set_max_sam_contexts(value: int):
@@ -76,9 +81,48 @@ def _cleanup_sam_context_unlocked(ctx):
         try:
             sam.cleanup()
         except Exception as exc:
-            print(f"[session] SAM context cleanup failed: {exc}")
+            logger.warning("SAM context cleanup failed: %s", exc)
     if isinstance(ctx, dict):
         ctx["cleaned"] = True
+
+
+_STALE_ACTIVE_TIMEOUT_SECS = 300.0  # 5 分钟无释放视为断连
+
+
+def _reap_stale_active_contexts():
+    """扫描所有上下文，强释 active 超时的孤儿（用户断连）。"""
+    now = time.monotonic()
+    with _SAM_SESSION_LOCK:
+        for key, ctx in list(_SAM_CONTEXTS.items()):
+            if ctx.get("active", 0) <= 0:
+                continue
+            since = ctx.get("_active_since", 0.0)
+            if since <= 0 or (now - since) <= _STALE_ACTIVE_TIMEOUT_SECS:
+                continue
+            logger.warning(
+                "SAM context active %.0fs (session=%s), force-releasing",
+                now - since, key[0],
+            )
+            ctx["active"] = 0
+            ctx["_active_since"] = 0.0
+            if ctx.get("stale"):
+                engine_type = ctx.get("engine_type")
+                _STALE_SAM_ACTIVE[engine_type] = max(
+                    0, int(_STALE_SAM_ACTIVE.get(engine_type, 0)) - 1
+                )
+                if _STALE_SAM_ACTIVE.get(engine_type, 0) == 0:
+                    _STALE_SAM_ACTIVE.pop(engine_type, None)
+                ctx["stale"] = False
+            lock = ctx.get("lock")
+            acquired = lock.acquire(blocking=False) if lock is not None else True
+            if not acquired:
+                continue
+            try:
+                _cleanup_sam_context_unlocked(ctx)
+            finally:
+                lock.release()
+            _SAM_CONTEXTS.pop(key, None)
+            logger.info("reaped stale SAM context: session=%s engine=%s", key[0], key[1])
 
 
 def _evict_sam_contexts_unlocked(keep_key=None):
@@ -99,10 +143,11 @@ def _evict_sam_contexts_unlocked(keep_key=None):
         finally:
             if lock is not None:
                 lock.release()
-        print(f"[session] evicted SAM context: session={old_key[0]} engine={old_key[1]}")
+        logger.info("evicted SAM context: session=%s engine=%s", old_key[0], old_key[1])
 
 
 def _get_sam_context(request, engine_type, retain=False):
+    _reap_stale_active_contexts()
     session_id = _request_session_id(request)
     key = (session_id, engine_type)
     with _SAM_SESSION_LOCK:
@@ -118,6 +163,7 @@ def _get_sam_context(request, engine_type, retain=False):
                 "free_logits": {},
                 "lock": threading.RLock(),
                 "active": 0,
+                "_active_since": 0.0,
                 "stale": False,
                 "cleaned": False,
             }
@@ -127,6 +173,8 @@ def _get_sam_context(request, engine_type, retain=False):
             _SAM_CONTEXTS.move_to_end(key)
         if retain:
             ctx["active"] += 1
+            if ctx["active"] == 1:
+                ctx["_active_since"] = time.monotonic()
         return ctx
 
 
@@ -135,6 +183,8 @@ def _release_sam_context(ctx):
     unload_engine_type = None
     with _SAM_SESSION_LOCK:
         ctx["active"] = max(0, int(ctx.get("active", 0)) - 1)
+        if ctx["active"] == 0:
+            ctx["_active_since"] = 0.0
         should_cleanup = ctx["active"] == 0 and bool(ctx.get("stale"))
         if should_cleanup:
             engine_type = ctx.get("engine_type")
@@ -224,7 +274,7 @@ def _unload_unused_for_tab2_sam_hq(keep_grounding_dino=False):
 
 
 def _ensure_sam_ready(image, engine_mode, keep_grounding_dino=False,
-                      request=None, retain=False):
+                      request=None, retain=False, image_id=None):
     engine_type = ENGINE_MODE_MAP.get(engine_mode, "mobile_sam")
     if not _MULTI_SESSION_MODE:
         with _SAM_SESSION_LOCK:
@@ -237,7 +287,10 @@ def _ensure_sam_ready(image, engine_mode, keep_grounding_dino=False,
     if engine_type == "sam_hq":
         _unload_unused_for_tab2_sam_hq(keep_grounding_dino=keep_grounding_dino)
     ctx = _get_sam_context(request, engine_type, retain=retain)
-    fingerprint = _image_fingerprint(image)
+    if image_id is not None:
+        fingerprint = (image.shape, image.dtype.str, image_id)
+    else:
+        fingerprint = _image_fingerprint(image)
     try:
         with ctx["lock"]:
             sam = ctx["sam"]
@@ -462,6 +515,52 @@ def _mask_seg_contains(seg_parent, seg_child, ratio=0.95):
     return overlap >= child_area * ratio
 
 
+def _merge_auto_masks(masks, indices):
+    """合并多个 auto-mask 的 segmentation，返回 merged bool array。"""
+    if not indices:
+        return None
+    seg_shape = masks[indices[0]]["segmentation"].shape
+    merged = np.zeros(seg_shape, dtype=bool)
+    for idx in indices:
+        if 0 <= idx < len(masks):
+            seg = np.asarray(masks[idx]["segmentation"], dtype=bool)
+            merged |= seg
+    return merged
+
+
+# ── 选择历史管理（模块级，绕过 gr.State 跨事件传递问题）──
+
+def _history_key(auto_masks_state, request=None):
+    """生成选择历史的 key（session_id + masks 实例 id）。"""
+    session_id = _request_session_id(request)
+    return (session_id, id(auto_masks_state) if auto_masks_state else 0)
+
+
+def _get_history(auto_masks_state, request=None):
+    return list(_SELECT_HISTORY.get(_history_key(auto_masks_state, request), []))
+
+
+def _push_history(auto_masks_state, step, request=None):
+    key = _history_key(auto_masks_state, request)
+    hist = _SELECT_HISTORY.get(key, [])
+    hist.append(step)
+    _SELECT_HISTORY[key] = hist
+
+
+def _pop_history(auto_masks_state, request=None):
+    key = _history_key(auto_masks_state, request)
+    hist = _SELECT_HISTORY.get(key, [])
+    if hist:
+        step = hist.pop()
+        _SELECT_HISTORY[key] = hist
+        return step, list(hist)
+    return None, []
+
+
+def _clear_history(auto_masks_state, request=None):
+    _SELECT_HISTORY.pop(_history_key(auto_masks_state, request), None)
+
+
 # ── SAM 预测 ────────────────────────────────────────────────────
 
 def _set_sam_logits_for_prediction(sam, logits):
@@ -554,46 +653,14 @@ def _apply_object_exclusions(sam, points, labels, mask):
     return mask
 
 
-def _predict_tab2_mask(ctx, points, labels, box_state,
-                       auto_masks=None, auto_choice=None, image_shape=None):
-    """统一的 SAM 预测入口，支持 box/free/auto 三种模式。"""
+def _predict_tab2_mask(ctx, points, labels, box_state):
+    """统一的 SAM 预测入口，支持 box/free 两种模式。"""
     with ctx["lock"]:
         sam = ctx["sam"]
         fingerprint = ctx.get("fingerprint")
         points = list(points or [])
         labels = list(labels or [])
         boxes = _normalize_box_state(box_state)
-
-        # ── auto 选区模式 ──
-        if auto_masks and auto_choice is not None:
-            if image_shape is None:
-                image_shape = (*sam._original_size, 3)
-            selected, excluded = _auto_choice_selected_excluded(auto_choice, auto_masks)
-            exclude_mask = _resolve_auto_masks(auto_masks, auto_choice)[1]
-            auto_mask = _auto_mask_from_selection(auto_masks, selected, excluded)
-
-            if auto_mask is None:
-                mask = _predict_tab2_mask(ctx, points, labels, box_state)
-                if exclude_mask is not None:
-                    mask &= ~exclude_mask
-                return _apply_object_exclusions(sam, points, labels, mask)
-
-            if any(int(label) == 1 for label in labels):
-                infer_boxes = _inference_box_state(box_state, auto_masks, auto_choice, image_shape)
-                prompt_mask = _predict_tab2_mask(ctx, points, labels, infer_boxes)
-                prompt_logits = sam._cached_logits
-            else:
-                prompt_mask = np.zeros(sam._original_size, dtype=bool)
-                prompt_logits = None
-            combined = auto_mask | prompt_mask
-            if exclude_mask is not None:
-                combined &= ~exclude_mask
-            combined = _apply_object_exclusions(sam, points, labels, combined)
-            sam._cached_mask = combined
-            sam._cached_logits = prompt_logits
-            sam._prev_logits = None
-            sam._prev_npoints = len(points)
-            return combined
 
         # ── box 模式 ──
         if boxes:
@@ -701,15 +768,13 @@ def _predict_tab2_box_batch_initial(ctx, boxes):
 
 def _draw_tab2_overlay(image, mask, points, labels, box_state=None,
                        mask_color=(255, 0, 0), opacity=0.4):
-    overlay = image.copy().astype(np.float32)
-    color_array = np.array(mask_color, dtype=np.float32)
-    for c in range(3):
-        overlay[:, :, c] = np.where(
-            mask,
-            overlay[:, :, c] * (1 - opacity) + color_array[c] * opacity,
-            overlay[:, :, c],
-        )
-    img = overlay.clip(0, 255).astype(np.uint8)
+    if mask is not None and np.any(mask):
+        darkened = cv2.addWeighted(image, 1.0 - opacity,  # type: ignore[arg-type]
+                                   np.full_like(image, mask_color, dtype=np.uint8),
+                                   opacity, 0)
+        img = np.where(mask[..., None], darkened, image)
+    else:
+        img = image.copy()
     for box in _normalize_box_state(box_state):
         x1, y1, x2, y2 = [int(round(v)) for v in box]
         cv2.rectangle(img, (x1, y1), (x2, y2), (255, 200, 0), 2)
@@ -721,7 +786,16 @@ def _draw_tab2_overlay(image, mask, points, labels, box_state=None,
     return img
 
 
+_AUTO_SEG_COLORS = [
+    (255, 0, 0), (0, 255, 0), (0, 0, 255),
+    (255, 255, 0), (0, 255, 255), (255, 0, 255),
+    (128, 0, 0), (0, 128, 0), (0, 0, 128),
+    (128, 128, 0), (0, 128, 128), (128, 0, 128),
+]
+
+
 def _draw_auto_segment_overlay(image, masks, selected_idx=None, excluded_indices=None):
+    """绘制自动分割结果：每个 mask 半透明彩色，选中的高亮。"""
     if selected_idx is None:
         selected = set()
     elif isinstance(selected_idx, (list, tuple, set)):
@@ -729,98 +803,35 @@ def _draw_auto_segment_overlay(image, masks, selected_idx=None, excluded_indices
     else:
         selected = {int(selected_idx)}
     del excluded_indices
-    img = image.copy()
+    overlay = image.copy().astype(np.float32)
     for i, mask_info in enumerate(masks):
-        if i in selected:
-            continue
+        color = _AUTO_SEG_COLORS[i % len(_AUTO_SEG_COLORS)]
+        opacity = 0.45 if i in selected else 0.2
         seg = np.asarray(mask_info["segmentation"], dtype=bool)
-        ys, xs = np.where(seg)
-        if len(xs) == 0:
-            continue
-        cx, cy = int(xs.mean()), int(ys.mean())
-        label = str(i + 1)
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+        for c in range(3):
+            overlay[:, :, c] = np.where(
+                seg,
+                overlay[:, :, c] * (1 - opacity) + color[c] * opacity,
+                overlay[:, :, c],
+            )
+    img = overlay.clip(0, 255).astype(np.uint8)
+    for i, mask_info in enumerate(masks):
+        meta = mask_info.get("_overlay_meta")
+        if meta:
+            cx, cy, tw, th, label = meta["cx"], meta["cy"], meta["tw"], meta["th"], meta["label"]
+        else:
+            seg = np.asarray(mask_info["segmentation"], dtype=bool)
+            ys, xs = np.where(seg)
+            if len(xs) == 0:
+                continue
+            cx, cy = int(xs.mean()), int(ys.mean())
+            label = str(i + 1)
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
         cv2.rectangle(img, (cx - tw // 2 - 4, cy - th - 4),
                       (cx + tw // 2 + 4, cy + 4), (0, 0, 0), -1)
         cv2.putText(img, label, (cx - tw // 2, cy),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
     return img
-
-
-# ── Auto-segment 状态管理（简化版）───────────────────────────────
-
-def _clean_indices(values):
-    result = []
-    for value in values or []:
-        try:
-            idx = int(value)
-        except Exception:
-            continue
-        if idx not in result:
-            result.append(idx)
-    return result
-
-
-def _ensure_auto_choice(state):
-    """统一的状态标准化+创建，合并 normalize + make。"""
-    if isinstance(state, dict):
-        selected = _clean_indices(state.get("selected", []))
-        excluded = _clean_indices(state.get("excluded", []))
-        last_pick = state.get("last_pick")
-        cycle_idx = int(state.get("cycle_idx", 0) or 0)
-    else:
-        selected = _clean_indices(state or [])
-        excluded = []
-        last_pick = None
-        cycle_idx = 0
-    pick = None
-    if last_pick is not None:
-        try:
-            pick = (int(last_pick[0]), int(last_pick[1]))
-        except Exception:
-            pass
-    return {"selected": selected, "excluded": excluded, "last_pick": pick, "cycle_idx": cycle_idx}
-
-
-def _auto_choice_selected_excluded(state, masks):
-    """返回 (selected, excluded) 两个 index list，限制在 masks 范围内。"""
-    choice = _ensure_auto_choice(state)
-    limit = len(masks or [])
-    return (
-        [i for i in choice["selected"] if 0 <= i < limit],
-        [i for i in choice["excluded"] if 0 <= i < limit],
-    )
-
-
-def _resolve_auto_masks(masks, choice_state):
-    """一次返回 (selected_mask, exclude_mask, selected_list, excluded_list)。"""
-    selected, excluded = _auto_choice_selected_excluded(choice_state, masks)
-    sel_mask = None
-    for idx in selected:
-        seg = np.asarray(masks[idx]["segmentation"], dtype=bool)
-        sel_mask = seg.copy() if sel_mask is None else (sel_mask | seg)
-    exc_mask = None
-    for idx in excluded:
-        seg = np.asarray(masks[idx]["segmentation"], dtype=bool)
-        exc_mask = seg.copy() if exc_mask is None else (exc_mask | seg)
-    return sel_mask, exc_mask, selected, excluded
-
-
-def _auto_mask_from_selection(masks, selected, excluded):
-    """从 selected/excluded 构建最终 auto mask。"""
-    sel_mask = None
-    for idx in selected:
-        seg = np.asarray(masks[idx]["segmentation"], dtype=bool)
-        sel_mask = seg.copy() if sel_mask is None else (sel_mask | seg)
-    if sel_mask is None:
-        return None
-    exc_mask = None
-    for idx in excluded:
-        seg = np.asarray(masks[idx]["segmentation"], dtype=bool)
-        exc_mask = seg.copy() if exc_mask is None else (exc_mask | seg)
-    if exc_mask is not None:
-        sel_mask &= ~exc_mask
-    return sel_mask
 
 
 def _postprocess_auto_masks(masks):
@@ -830,6 +841,37 @@ def _postprocess_auto_masks(masks):
         float(m.get("area", 0.0)),
     ), reverse=True)[:AUTO_SEGMENT_MAX_MASKS]
     kept.sort(key=lambda m: int(m.get("area", 0)), reverse=True)
+    for i, mask_info in enumerate(kept):
+        # Pre-convert to contiguous bool array to avoid repeated decode/copy
+        # in _find_masks_at, _draw_auto_segment_overlay, etc.
+        seg = np.asarray(mask_info["segmentation"], dtype=bool)
+        if not seg.flags["C_CONTIGUOUS"]:
+            seg = np.ascontiguousarray(seg)
+        mask_info["segmentation"] = seg
+        # Compute centroid from bounding box region (much faster than full np.where)
+        bbox = mask_info.get("bbox")  # SAM auto masks provide [x, y, w, h]
+        if bbox is not None:
+            bx, by, bw, bh = [int(v) for v in bbox]
+            if bw > 0 and bh > 0:
+                crop = seg[by:by + bh, bx:bx + bw]
+                ys_local, xs_local = np.where(crop)
+                if len(xs_local) > 0:
+                    cx, cy = int(xs_local.mean()) + bx, int(ys_local.mean()) + by
+                else:
+                    cx, cy = bx + bw // 2, by + bh // 2
+            else:
+                cx, cy = 0, 0
+        else:
+            ys, xs = np.where(seg)
+            if len(xs) > 0:
+                cx, cy = int(xs.mean()), int(ys.mean())
+            else:
+                cx, cy = 0, 0
+        label = str(i + 1)
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+        mask_info["_overlay_meta"] = {
+            "cx": cx, "cy": cy, "tw": tw, "th": th, "label": label,
+        }
     return kept
 
 
@@ -844,62 +886,6 @@ def _find_masks_at(masks, x, y):
     hits.sort()
     min_area = hits[0][0]
     return [idx for area, idx in hits if area <= min_area * 10]
-
-
-def _resolve_mask_pick(masks, x, y, choice_state, candidates=None):
-    hits = candidates if candidates is not None else _find_masks_at(masks, x, y)
-    if not hits:
-        return None, choice_state
-    choice_state = _ensure_auto_choice(choice_state)
-    px, py = int(x), int(y)
-    last_pick = choice_state.get("last_pick")
-    cycle_idx = int(choice_state.get("cycle_idx", 0))
-    if last_pick == (px, py) and len(hits) > 1:
-        cycle_idx = (cycle_idx + 1) % len(hits)
-    else:
-        cycle_idx = 0
-    idx = hits[cycle_idx]
-    updated = _ensure_auto_choice({
-        "selected": choice_state["selected"],
-        "excluded": choice_state["excluded"],
-        "last_pick": (px, py),
-        "cycle_idx": cycle_idx,
-    })
-    return idx, updated
-
-
-def _maintain_included_anti_chain(masks, selected, added_idx):
-    if not masks or not (0 <= added_idx < len(masks)):
-        return list(selected)
-    seg_new = np.asarray(masks[added_idx]["segmentation"], dtype=bool)
-    pruned = []
-    for idx in selected:
-        if idx == added_idx or not (0 <= idx < len(masks)):
-            continue
-        seg_i = np.asarray(masks[idx]["segmentation"], dtype=bool)
-        if _mask_seg_contains(seg_new, seg_i) or _mask_seg_contains(seg_i, seg_new):
-            continue
-        pruned.append(idx)
-    pruned.append(added_idx)
-    return pruned
-
-
-def _inference_box_state(box_state, masks, auto_choice, image_shape):
-    if masks:
-        selected, _ = _auto_choice_selected_excluded(auto_choice, masks)
-        auto_boxes = []
-        exclude_mask = _resolve_auto_masks(masks, auto_choice)[1]
-        for idx in selected:
-            seg = np.asarray(masks[idx]["segmentation"], dtype=bool)
-            if exclude_mask is not None:
-                seg = seg & ~exclude_mask
-            bbox = _mask_bbox_from_seg(seg)
-            if bbox is not None:
-                auto_boxes.append(_expand_box(bbox, image_shape))
-        if auto_boxes:
-            return auto_boxes
-    boxes = list(_normalize_box_state(box_state))
-    return boxes or None
 
 
 # ── Alpha 生成 ──────────────────────────────────────────────────
@@ -1024,7 +1010,11 @@ def _sam_strict_alpha(sam_mask, points_state, labels_state,
         inner = cv2.erode(mask_u8, band_kernel) > 0
         band = outer & ~inner
         band_alpha = 1.0 / (1.0 + np.exp(-logits[band].astype(np.float32)))
-        alpha[band] = band_alpha
+        # 只在 mask 内部使用 band_alpha，保护实心前景不被 sigmoid 降低
+        # mask 外部的 band 像素保持 alpha=0（后处理会抑制外溢）
+        inside = band & (mask_u8 > 0)
+        inside_band = inside[band]  # bool index aligned to band_alpha
+        alpha[inside] = np.maximum(alpha[inside], band_alpha[inside_band])
 
     return (np.clip(alpha, 0.0, 1.0) * 255).round().astype(np.uint8), subject_box
 
@@ -1093,224 +1083,181 @@ def _sam_guided_rmbg_alpha(image, sam_mask, points_state, labels_state, box_stat
 def on_image_upload(image, request: gr.Request = None):
     """接收 numpy 数组（来自 gr.Image 上传/粘贴）。"""
     _clear_session_sam_contexts(request)
-    empty_auto_choice = _ensure_auto_choice({"selected": [], "excluded": []})
     if image is None:
-        return tuple(gr.update() for _ in range(14))
+        return tuple(gr.update() for _ in range(16))
     try:
         img = np.asarray(image)
         if img.ndim == 2:
             img = np.stack([img] * 3, axis=-1)
         elif img.shape[2] == 4:
             img = img[:, :, :3]
+        new_image_id = _uuid.uuid4().hex[:16]
         return (gr.update(value=None, visible=False), gr.update(value=img, visible=True),
                 gr.update(visible=True), gr.update(visible=True), gr.update(visible=False),
                 gr.update(value=None, visible=False), [], [], None, None,
-                [], empty_auto_choice, "",
-                "已上传 | 直接点图选取，或输入文字定位，或点击「自动分割」")
+                [], new_image_id, False, "已上传 | 直接点图选取，或输入文字定位，或点击「自动分割」", None, None)
     except Exception:
         return (gr.update(value=None, visible=True), gr.update(value=None, visible=False),
                 gr.update(visible=False), gr.update(visible=False), gr.update(visible=False),
                 gr.update(value=None, visible=False), [], [], None, None,
-                [], empty_auto_choice, "", "图片加载失败")
+                [], None, False, "图片加载失败", None, None)
 
 
 def on_canvas_clear_source(request: gr.Request = None):
     _clear_session_sam_contexts(request)
     return (gr.update(value=None, visible=True), gr.update(value=None, visible=False),
             gr.update(visible=False), gr.update(visible=False), gr.update(visible=False),
-            gr.update(value=None, visible=False), [], [], None, None,
-            [], _ensure_auto_choice({"selected": [], "excluded": []}), "", "请先上传图片")
+            gr.update(value=None, visible=False),
+            [], [], None, None, [], None, False, "请先上传图片", None, None)
 
 
 def on_image_click(image, evt: gr.SelectData, mode, engine_mode,
                    points_state, labels_state, box_state,
-                   auto_masks_state, auto_choice_state,
+                   auto_masks_state, auto_select_mode,
+                   image_id=None,
+                   selected_auto_indices_state=None,
                    request: gr.Request = None):
-    choice = _ensure_auto_choice(auto_choice_state)
-    _RET_ERR = (image, gr.update(visible=False), gr.update(value=None, visible=False),
-                points_state, labels_state, box_state, choice)
+    _RET_BASE = (image, gr.update(visible=False), gr.update(value=None, visible=False),
+                 points_state, labels_state, box_state, auto_select_mode)
+    _ret_err = lambda msg: (*_RET_BASE, msg, None, None)
     if image is None:
-        return *_RET_ERR, "请先上传图片"
+        return _ret_err("请先上传图片")
     try:
         x, y = evt.index[0], evt.index[1]
     except Exception:
-        return *_RET_ERR, "无法获取点击坐标"
+        return _ret_err("无法获取点击坐标")
 
-    h, w = image.shape[:2]
-    if not (0 <= x < w and 0 <= y < h):
-        return *_RET_ERR, "点击超出图像范围"
-
-    label_val = 1 if mode == "正向选取（我要）" else 0
-    new_points = list(points_state or [])
-    new_labels = list(labels_state or [])
-    new_choice = choice
-    status_parts = []
-    hit_indices = (
-        _find_masks_at(auto_masks_state, x, y) if auto_masks_state else []
-    )
-
-    if hit_indices and label_val == 1:
-        picked_idx, new_choice = _resolve_mask_pick(
-            auto_masks_state, x, y, choice,
-        )
-        selected, excluded = _auto_choice_selected_excluded(new_choice, auto_masks_state)
-        if picked_idx in excluded:
-            excluded.remove(picked_idx)
-        selected = _maintain_included_anti_chain(
-            auto_masks_state, selected, picked_idx,
-        )
-        new_choice = _ensure_auto_choice({
-            "selected": selected,
-            "excluded": excluded,
-            "last_pick": new_choice.get("last_pick"),
-            "cycle_idx": new_choice.get("cycle_idx", 0),
-        })
-        status_parts.append(f"已加入主体 #{picked_idx + 1}")
-        if len(hit_indices) > 1:
-            status_parts.append(
-                f"粒度 {new_choice['cycle_idx'] + 1}/{len(hit_indices)}（同点连点切换）"
-            )
-    elif hit_indices and label_val == 0:
-        picked_idx, new_choice = _resolve_mask_pick(
-            auto_masks_state, x, y, choice, candidates=hit_indices,
-        )
-        selected, excluded = _auto_choice_selected_excluded(new_choice, auto_masks_state)
-        if picked_idx in selected:
-            selected.remove(picked_idx)
-            status_parts.append(f"已移除主体 #{picked_idx + 1}")
-        if picked_idx not in excluded:
-            excluded.append(picked_idx)
-        new_choice = _ensure_auto_choice({
-            "selected": selected,
-            "excluded": excluded,
-            "last_pick": new_choice.get("last_pick"),
-            "cycle_idx": new_choice.get("cycle_idx", 0),
-        })
-        status_parts.append(f"已排除 #{picked_idx + 1}")
-        if len(hit_indices) > 1:
-            status_parts.append(
-                f"粒度 {new_choice['cycle_idx'] + 1}/{len(hit_indices)}（同点连点切换）"
-            )
-    else:
-        new_points.append([x, y])
-        new_labels.append(label_val)
-        tag = "正向" if label_val == 1 else "负向"
-        status_parts.append(
-            f"已添加{tag}点 ({x}, {y})" + ("，SAM 负向排除" if label_val == 0 else "")
-        )
-
-    has_selection = (
-        bool(_auto_choice_selected_excluded(new_choice, auto_masks_state)[0])
-        or new_points
-        or len(_normalize_box_state(box_state)) > 0
-    )
-
-    if not has_selection:
-        if auto_masks_state:
-            sel, excl = _auto_choice_selected_excluded(new_choice, auto_masks_state)
-            overlay = _draw_auto_segment_overlay(image, auto_masks_state, sel, excl)
+    # ── 自动分割点选模式 ──
+    if auto_select_mode and auto_masks_state:
+        h, w = image.shape[:2]
+        if not (0 <= x < w and 0 <= y < h):
+            return _ret_err("点击超出图像范围")
+        hit_indices = _find_masks_at(auto_masks_state, x, y)
+        label_val = 1 if mode == "正向选取（我要）" else 0
+        prev_indices = selected_auto_indices_state or []
+        logger.info("auto-click: pos=(%d,%d), hit=%s, prev=%s, label=%d",
+                    x, y, hit_indices, prev_indices, label_val)
+        if not hit_indices:
+            overlay = _draw_auto_segment_overlay(image, auto_masks_state,
+                                                 selected_idx=prev_indices or None)
+            return (overlay, gr.update(visible=False), gr.update(value=None, visible=False),
+                    [], [], None, True, "未命中任何主体，请点击有色区域", None, gr.update())
+        if label_val == 1:
+            new_indices = sorted(set(prev_indices) | set(hit_indices))
         else:
-            overlay = image
-        return (
-            overlay, gr.update(visible=False), gr.update(value=None, visible=False),
-            new_points, new_labels, box_state, new_choice,
-            "；".join(status_parts) + "；当前未选择主体",
-        )
+            new_indices = sorted(set(prev_indices) - set(hit_indices))
+        if not new_indices:
+            overlay = _draw_auto_segment_overlay(image, auto_masks_state)
+            return (overlay, gr.update(visible=False), gr.update(value=None, visible=False),
+                    [], [], None, True, "已排除所有主体，请重新选取", None, gr.update())
+        merged_seg = _merge_auto_masks(auto_masks_state, new_indices)
+        # 记录本次变更到模块级历史
+        added_indices = sorted(set(new_indices) - set(prev_indices))
+        removed_indices = sorted(set(prev_indices) - set(new_indices))
+        if added_indices:
+            _push_history(auto_masks_state, added_indices, request)
+        elif removed_indices:
+            _push_history(auto_masks_state, (-1, removed_indices), request)
+        logger.info("auto-click result: new_indices=%s, added=%s, removed=%s, area=%d",
+                    new_indices, added_indices, removed_indices,
+                    int(merged_seg.sum()) if merged_seg is not None else 0)
+        bbox = _mask_bbox_from_seg(merged_seg)
+        if bbox is None:
+            return _ret_err("mask 无效")
+        mask = merged_seg
+        overlay = _draw_tab2_overlay(image, mask, [[x, y]], [1], [bbox])
+        total = len(new_indices)
+        added = len(set(hit_indices) - set(prev_indices)) if label_val == 1 else 0
+        if label_val == 0:
+            tag = f"已排除 {len(hit_indices)} 个主体，剩余 {total} 个"
+        elif prev_indices:
+            tag = f"已累积选中 {total} 个主体（+{added}）"
+        elif len(hit_indices) > 1:
+            tag = f"已合并 {len(hit_indices)} 个主体"
+        else:
+            tag = f"已选中主体 #{hit_indices[0] + 1}"
+        return (overlay, gr.update(visible=True), gr.update(value=None, visible=False),
+                [[x, y]], [1], None, True, f"{tag}，可继续点击添加", merged_seg,
+                new_indices)
+
+    # ── 正常点选模式 ──
+    label_val = 1 if mode == "正向选取（我要）" else 0
+    new_points = list(points_state) + [[x, y]]
+    new_labels = list(labels_state) + [label_val]
 
     try:
         ctx = _ensure_sam_ready(
             image, engine_mode,
             keep_grounding_dino=True, retain=True, request=request,
+            image_id=image_id,
         )
         try:
-            mask = _predict_tab2_mask(
-                ctx, new_points, new_labels, box_state,
-                auto_masks_state, new_choice, image_shape=image.shape,
-            )
+            mask = _predict_tab2_mask(ctx, new_points, new_labels, box_state)
+            if label_val == 0:
+                mask = _apply_object_exclusions(ctx["sam"], new_points, new_labels, mask)
         finally:
             _release_sam_context(ctx)
-
-        if label_val == 1 and not hit_indices and not auto_masks_state and _normalize_box_state(box_state):
-            # 仅在已有框（如文本定位）时才合并更新；无框时不从 mask 生成（避免反馈缩小）
-            updated_box_state = _update_positive_prompt_box(
-                mask, box_state, image.shape, point=[x, y],
-            )
-        else:
-            updated_box_state = box_state
-
-        overlay_boxes = None if auto_masks_state else updated_box_state
-        if auto_masks_state:
-            sel, excl = _auto_choice_selected_excluded(new_choice, auto_masks_state)
-            base = _draw_auto_segment_overlay(image, auto_masks_state, sel, excl)
-            overlay = _draw_tab2_overlay(base, mask, new_points, new_labels, overlay_boxes, opacity=0.35)
-        else:
-            overlay = _draw_tab2_overlay(
-                image, mask, new_points, new_labels, overlay_boxes,
-            )
-
-        selected, excluded = _auto_choice_selected_excluded(new_choice, auto_masks_state)
-        if selected:
-            status_parts.append(f"已选 {len(selected)} 块")
-        if excluded:
-            status_parts.append(f"已排除 {len(excluded)} 块")
-        neg_count = sum(int(l) == 0 for l in new_labels)
-        if neg_count:
-            status_parts.append(f"负向点 {neg_count} 个")
-        if new_points:
-            status_parts.append(f"共 {len(new_points)} 个标记点")
-        return (
-            overlay, gr.update(visible=True), gr.update(value=None, visible=False),
-            new_points, new_labels, updated_box_state, new_choice,
-            "；".join(status_parts),
+        overlay = _draw_tab2_overlay(
+            image, mask, new_points, new_labels, box_state
         )
+        tag = "正向" if label_val == 1 else "负向"
+        status = f"已添加{tag}标记 ({x}, {y})，共 {len(new_points)} 个点"
+        return (overlay, gr.update(visible=True), gr.update(value=None, visible=False),
+                new_points, new_labels, box_state, False, status, gr.update(), gr.update())
     except Exception as e:
-        return (
-            image, gr.update(visible=False), gr.update(value=None, visible=False),
-            new_points, new_labels, box_state, new_choice, f"预测失败: {e}",
-        )
+        return (image, gr.update(visible=False), gr.update(value=None, visible=False),
+                new_points, new_labels, box_state, False, f"预测失败: {e}", gr.update(),
+                gr.update())
 
 
 def on_auto_segment(image, engine_mode, points_state, labels_state, box_state,
-                    request: gr.Request = None):
-    empty_auto_choice = _ensure_auto_choice({"selected": [], "excluded": []})
+                    image_id=None, request: gr.Request = None):
+    # 防止 _SELECT_HISTORY 无限增长：保留最近 50 个 session 的历史
+    if len(_SELECT_HISTORY) > 50:
+        keys = list(_SELECT_HISTORY.keys())
+        for old_key in keys[:-25]:
+            _SELECT_HISTORY.pop(old_key, None)
     if image is None:
         return (
             None, points_state, labels_state, box_state, [],
-            empty_auto_choice, "请先上传图片",
+            image_id, False, "请先上传图片", None, None,
         )
     try:
-        ctx = _ensure_sam_ready(image, engine_mode, retain=True, request=request)
+        ctx = _ensure_sam_ready(image, engine_mode, retain=True, request=request, image_id=image_id)
         try:
-            masks = ctx["sam"].auto_segment()
+            masks = ctx["sam"].auto_segment(points_per_side=32)
         finally:
             _release_sam_context(ctx)
         masks = _postprocess_auto_masks(masks)
         if not masks:
             return (
                 image, points_state, labels_state, box_state, [],
-                empty_auto_choice, "未检测到主体",
+                image_id, False, "未检测到主体", None, None,
             )
+        best_iou = float(masks[0].get("predicted_iou", 0.0))
+        best_stability = float(masks[0].get("stability_score", 0.0))
+        if best_iou < 0.85 or best_stability < 0.90:
+            logger.warning("SAM 自动分割最高质量 mask 偏低 (iou=%.3f, stability=%.3f)，"
+                           "建议手动标记精修", best_iou, best_stability)
         overlay = _draw_auto_segment_overlay(image, masks)
         return (
             overlay, points_state, labels_state, box_state, masks,
-            empty_auto_choice,
-            f"发现 {len(masks)} 个候选主体；正向加入、负向排除，同点连点可切换粒度，可继续打点精修",
+            image_id, True, f"发现 {len(masks)} 个主体，点击选择", None, None,
         )
     except Exception as e:
         return (
             image, points_state, labels_state, box_state, [],
-            empty_auto_choice, f"自动分割失败: {e}",
+            image_id, False, f"自动分割失败: {e}", None, None,
         )
 
 
-def on_text_locate(image, caption, engine_mode, request: gr.Request = None):
-    empty_auto_choice = _ensure_auto_choice({"selected": [], "excluded": []})
+def on_text_locate(image, caption, engine_mode, image_id=None, request: gr.Request = None):
     if image is None:
         return (None, gr.update(visible=False), gr.update(value=None, visible=False),
-                [], [], None, [], empty_auto_choice, "请先上传图片")
+                [], [], None, [], image_id, False, "请先上传图片", None, None)
     if not caption or not caption.strip():
         return (image, gr.update(visible=False), gr.update(value=None, visible=False),
-                [], [], None, [], empty_auto_choice, "请输入定位描述")
+                [], [], None, [], image_id, False, "请输入定位描述", None, None)
 
     try:
         caption_for_dino = caption.strip()
@@ -1323,7 +1270,7 @@ def on_text_locate(image, caption, engine_mode, request: gr.Request = None):
         )
         if not boxes:
             return (image, gr.update(visible=False), gr.update(value=None, visible=False),
-                    [], [], None, [], empty_auto_choice, "未找到匹配物体")
+                    [], [], None, [], image_id, False, "未找到匹配物体", None, None)
 
         h, w = image.shape[:2]
         boxes, scores, filter_stats = _filter_text_candidate_boxes(
@@ -1331,7 +1278,7 @@ def on_text_locate(image, caption, engine_mode, request: gr.Request = None):
         )
         if not boxes:
             return (image, gr.update(visible=False), gr.update(value=None, visible=False),
-                    [], [], None, [], empty_auto_choice, "候选框过滤后为空，请换个描述")
+                    [], [], None, [], image_id, False, "候选框过滤后为空，请换个描述", None, None)
 
         prompt_boxes = []
         for box_raw in boxes:
@@ -1347,14 +1294,10 @@ def on_text_locate(image, caption, engine_mode, request: gr.Request = None):
         ctx = _ensure_sam_ready(
             image, engine_mode,
             keep_grounding_dino=True, retain=True, request=request,
+            image_id=image_id,
         )
         try:
             with ctx["lock"]:
-                sam = ctx["sam"]
-                if not sam._image_set or _image_fingerprint(image) != ctx.get("fingerprint"):
-                    sam.set_image(image)
-                    ctx["fingerprint"] = _image_fingerprint(image)
-                    _reset_sam_interaction_state_unlocked(ctx)
                 mask = _predict_tab2_box_batch_initial(ctx, prompt_boxes)
         finally:
             _release_sam_context(ctx)
@@ -1374,62 +1317,140 @@ def on_text_locate(image, caption, engine_mode, request: gr.Request = None):
             f"score={score_text}{score_note}{filter_text}{cap_text}；可继续加正/负点修正"
         )
         return (overlay, gr.update(visible=True), gr.update(value=None, visible=False),
-                [], [], prompt_boxes, [], empty_auto_choice, status)
+                [], [], prompt_boxes, [], image_id, False, status, None, None)
     except Exception as e:
         return (image, gr.update(visible=False), gr.update(value=None, visible=False),
-                [], [], None, [], empty_auto_choice, f"定位失败: {e}")
+                [], [], None, [], image_id, False, f"定位失败: {e}", None, None)
+
+
+def _run_alpha_pipeline(image, mask, points_state, labels_state, box_state,
+                        mode_key, cached_logits=None):
+    """统一的 mask→alpha 管线：根据 mode_key 选择 rmbg_refine 或 sam_strict。
+
+    Returns (alpha, subject_box, roi_box, quality_notes).
+    """
+    if mode_key == "rmbg_refine":
+        try:
+            alpha, subject_box, roi_box, quality_notes = _sam_guided_rmbg_alpha(
+                image, mask, points_state, labels_state, box_state,
+            )
+            return alpha, subject_box, roi_box, quality_notes
+        except Exception as e:
+            logger.warning("RMBG 精修失败 (%s)，回退到 SAM 快速模式", e)
+    alpha, subject_box = _sam_strict_alpha(
+        mask, points_state, labels_state, box_state, image.shape,
+        logits=cached_logits,
+    )
+    quality_notes = ["RMBG 精修失败，已回退到 SAM 快速模式"] if mode_key == "rmbg_refine" else ["SAM fast boundary"]
+    return alpha, subject_box, None, quality_notes
 
 
 def on_generate_cutout(image, engine_mode, output_mode, points_state,
                        labels_state, box_state, auto_masks_state=None,
-                       auto_choice_state=None, preserve_transparency=False,
-                       save_debug=False, request: gr.Request = None):
+                       preserve_transparency=False,
+                       save_debug=False, image_id=None,
+                       selected_auto_mask=None,
+                       selected_auto_indices=None,
+                       request: gr.Request = None):
     empty_states = (None, None, None, [], gr.update(visible=False))
     pending_states = (gr.update(), gr.update(), gr.update(), gr.update(), gr.update(visible=False))
 
     if image is None:
         yield (gr.update(), gr.update(), gr.update(value=None, visible=False), gr.update(),
-               *empty_states)
+               *empty_states, gr.update(), gr.update())
         return
     if (
         not points_state
         and len(_normalize_box_state(box_state)) == 0
-        and not bool(_auto_choice_selected_excluded(auto_choice_state, auto_masks_state)[0])
+        and selected_auto_mask is None
     ):
         yield (gr.update(), gr.update(), gr.update(value=None, visible=False),
-               "请先标记区域或使用文本定位", *empty_states)
+               "请先标记区域或使用文本定位", *empty_states, gr.update(), gr.update())
         return
 
     try:
-        yield (gr.update(), gr.update(), gr.update(value=None, visible=False),
-               "SAM 分割中...", *pending_states)
-        ctx = _ensure_sam_ready(image, engine_mode, request=request, retain=True)
-        try:
-            mask = _predict_tab2_mask(
-                ctx, points_state, labels_state, box_state,
-                auto_masks_state, auto_choice_state, image_shape=image.shape,
+        # 自动分割选中的 mask：对每个主体独立处理，避免跨主体背景残留
+        if selected_auto_mask is not None and selected_auto_indices and auto_masks_state:
+            # 如果用户在自动分割后又打了新点，用 SAM 预测新点的 mask 并合并
+            has_new_points = (
+                len(points_state) > 1
+                or (len(points_state) == 1 and not selected_auto_indices)
             )
-            cached_logits = ctx["sam"]._cached_logits
-        finally:
-            _release_sam_context(ctx)
-
-        mode_key = TAB2_OUTPUT_MODES.get(output_mode, "sam_strict")
-        quality_notes = []
-        roi_box = None
-        if mode_key == "rmbg_refine":
-            yield (gr.update(), gr.update(), gr.update(value=None, visible=False),
-                   "RMBG-2.0 精修中...", *pending_states)
-            alpha, subject_box, roi_box, quality_notes = _sam_guided_rmbg_alpha(
-                image, mask, points_state, labels_state, box_state,
-            )
+            if has_new_points and box_state is None:
+                yield (gr.update(), gr.update(), gr.update(value=None, visible=False),
+                       "合并自动分割 + 手动标记...", *pending_states, gr.update(), gr.update())
+                ctx = _ensure_sam_ready(image, engine_mode, request=request, retain=True, image_id=image_id)
+                try:
+                    point_mask = _predict_tab2_mask(ctx, points_state, labels_state, box_state)
+                finally:
+                    _release_sam_context(ctx)
+                # 合并 SAM 预测与自动分割 mask
+                merged = selected_auto_mask | point_mask
+                mode_key = TAB2_OUTPUT_MODES.get(output_mode, "sam_strict")
+                alpha, subject_box, roi_box, quality_notes = _run_alpha_pipeline(
+                    image, merged, points_state, labels_state, box_state, mode_key,
+                )
+                if mode_key != "rmbg_refine":
+                    quality_notes = ["SAM fast boundary (自动分割+手动标记合并)"]
+                cached_logits = None
+            else:
+                # 纯自动分割，每个主体独立处理
+                yield (gr.update(), gr.update(), gr.update(value=None, visible=False),
+                       "使用自动分割结果生成中...", *pending_states, gr.update(), gr.update())
+                mode_key = TAB2_OUTPUT_MODES.get(output_mode, "sam_strict")
+                quality_notes = []
+                h, w = image.shape[:2]
+                combined_alpha = np.zeros((h, w), dtype=np.uint8)
+                subject_boxes = []
+                for idx in selected_auto_indices:
+                    if idx < 0 or idx >= len(auto_masks_state):
+                        continue
+                    seg = np.asarray(auto_masks_state[idx]["segmentation"], dtype=bool)
+                    if not seg.any():
+                        continue
+                    single_box = _mask_bbox_from_seg(seg)
+                    if single_box is None:
+                        continue
+                    a, sb, _, _ = _run_alpha_pipeline(
+                        image, seg, points_state, labels_state, [single_box], mode_key,
+                    )
+                    combined_alpha = np.maximum(combined_alpha, a)
+                    subject_boxes.append(sb)
+                if not subject_boxes:
+                    raise ValueError("自动分割 mask 无效")
+                # 合并所有主体的 bounding box
+                all_y1 = min(b[1] for b in subject_boxes)
+                all_x1 = min(b[0] for b in subject_boxes)
+                all_y2 = max(b[3] for b in subject_boxes)
+                all_x2 = max(b[2] for b in subject_boxes)
+                subject_box = [all_x1, all_y1, all_x2, all_y2]
+                alpha = combined_alpha
+                cached_logits = None
+                roi_box = None
+                quality_notes.append(f"自动分割 {len(selected_auto_indices)} 个主体独立处理")
         else:
             yield (gr.update(), gr.update(), gr.update(value=None, visible=False),
-                   "SAM 快速硬边界导出中...", *pending_states)
-            alpha, subject_box = _sam_strict_alpha(
-                mask, points_state, labels_state, box_state, image.shape,
-                logits=cached_logits,
+                   "SAM 分割中...", *pending_states, gr.update(), gr.update())
+            ctx = _ensure_sam_ready(image, engine_mode, request=request, retain=True, image_id=image_id)
+            try:
+                mask = _predict_tab2_mask(
+                    ctx, points_state, labels_state, box_state,
+                )
+                cached_logits = ctx["sam"]._cached_logits
+            finally:
+                _release_sam_context(ctx)
+
+            mode_key = TAB2_OUTPUT_MODES.get(output_mode, "sam_strict")
+            if mode_key == "rmbg_refine":
+                yield (gr.update(), gr.update(), gr.update(value=None, visible=False),
+                       "RMBG-2.0 精修中...", *pending_states, gr.update(), gr.update())
+            else:
+                yield (gr.update(), gr.update(), gr.update(value=None, visible=False),
+                       "SAM 快速硬边界导出中...", *pending_states, gr.update(), gr.update())
+            alpha, subject_box, roi_box, quality_notes = _run_alpha_pipeline(
+                image, mask, points_state, labels_state, box_state, mode_key,
+                cached_logits=cached_logits,
             )
-            quality_notes.append("SAM fast boundary")
 
         output_dir = get_output_path()
         out_path = os.path.join(output_dir, "cutout.png")
@@ -1464,21 +1485,55 @@ def on_generate_cutout(image, engine_mode, output_mode, points_state,
             result, gr.update(visible=True),
             gr.update(value=out_path, visible=True),
             f"已完成: {os.path.basename(out_path)}\n主体区域: [{sx1},{sy1},{sx2},{sy2}]{roi_text}{note_text}",
-            image, rgba, rgba, [], gr.update(visible=True),
+            image, rgba, rgba, [], gr.update(visible=True), gr.update(), gr.update(),
         )
     except Exception as e:
         yield (gr.update(), gr.update(), gr.update(value=None, visible=False),
-               f"生成失败: {e}", *empty_states)
+               f"生成失败: {e}", *empty_states, None, None)
 
 
 def on_undo_point(image, points_state, labels_state, box_state,
-                  auto_masks_state, auto_choice_state,
-                  engine_mode, request: gr.Request = None):
-    """撤销最后一个点，重新预测 mask。"""
-    empty = _ensure_auto_choice(auto_choice_state)
-    if image is None or not points_state:
+                  auto_masks_state, auto_select_mode,
+                  engine_mode, image_id=None,
+                  selected_auto_indices_state=None,
+                  request: gr.Request = None):
+    """撤销最后一个标记点，重新预测 mask。"""
+    if image is None:
         return (image, gr.update(visible=False), gr.update(value=None, visible=False),
-                points_state, labels_state, box_state, empty, "没有可撤销的标记")
+                points_state, labels_state, box_state, auto_select_mode,
+                "请先上传图片", gr.update(), gr.update())
+
+    # ── 自动分割选中模式：按历史栈撤销 ──
+    step, remaining_hist = _pop_history(auto_masks_state, request)
+    logger.info("on_undo_point: auto_select_mode=%s, indices=%s, step=%s, hist_remain=%d, points=%s",
+                auto_select_mode, selected_auto_indices_state, step, len(remaining_hist), points_state)
+    if auto_select_mode and step is not None:
+        prev_indices = selected_auto_indices_state or []
+        if isinstance(step, tuple) and step[0] == -1:
+            restored = step[1]
+            new_indices = sorted(set(prev_indices) | set(restored))
+        else:
+            new_indices = sorted(set(prev_indices) - set(step))
+        if new_indices:
+            merged_seg = _merge_auto_masks(auto_masks_state, new_indices)
+            logger.info("undo auto-select: step=%s, remaining=%s, area=%d",
+                        step, new_indices, int(merged_seg.sum()) if merged_seg is not None else 0)
+            bbox = _mask_bbox_from_seg(merged_seg) if merged_seg is not None else None
+            overlay = _draw_tab2_overlay(image, merged_seg, [], [], [bbox] if bbox else [])
+            return (overlay, gr.update(visible=True), gr.update(value=None, visible=False),
+                    [], [], box_state, True,
+                    f"已撤销选中，剩余 {len(new_indices)} 个主体", gr.update(), new_indices)
+        if auto_masks_state:
+            overlay = _draw_auto_segment_overlay(image, auto_masks_state)
+        else:
+            overlay = image
+        return (overlay, gr.update(visible=False), gr.update(value=None, visible=False),
+                [], [], box_state, True, "已撤销选中，请重新点击选择主体", None, None)
+
+    if not points_state:
+        return (image, gr.update(visible=False), gr.update(value=None, visible=False),
+                points_state, labels_state, box_state, auto_select_mode,
+                "没有可撤销的标记", gr.update(), gr.update())
 
     new_points = list(points_state[:-1])
     new_labels = list(labels_state[:-1])
@@ -1486,60 +1541,52 @@ def on_undo_point(image, points_state, labels_state, box_state,
     if not new_points:
         _reset_session_sam_interaction_state(request)
         if auto_masks_state:
-            sel, excl = _auto_choice_selected_excluded(empty, auto_masks_state)
-            overlay = _draw_auto_segment_overlay(image, auto_masks_state, sel, excl)
+            overlay = _draw_auto_segment_overlay(image, auto_masks_state)
         else:
             overlay = image
         return (overlay, gr.update(visible=False), gr.update(value=None, visible=False),
-                [], [], box_state, empty, "已撤销所有标记")
+                [], [], box_state, False, "已撤销所有标记", None, None)
 
     try:
         ctx = _ensure_sam_ready(
             image, engine_mode,
             keep_grounding_dino=True, retain=True, request=request,
+            image_id=image_id,
         )
         try:
             mask = _predict_tab2_mask(
                 ctx, new_points, new_labels, box_state,
-                auto_masks_state, empty, image_shape=image.shape,
             )
         finally:
             _release_sam_context(ctx)
 
-        overlay_boxes = None if auto_masks_state else box_state
-        if auto_masks_state:
-            sel, excl = _auto_choice_selected_excluded(empty, auto_masks_state)
-            base = _draw_auto_segment_overlay(image, auto_masks_state, sel, excl)
-            overlay = _draw_tab2_overlay(base, mask, new_points, new_labels, overlay_boxes, opacity=0.35)
-        else:
-            overlay = _draw_tab2_overlay(image, mask, new_points, new_labels, overlay_boxes)
+        overlay = _draw_tab2_overlay(image, mask, new_points, new_labels, box_state)
 
         return (overlay, gr.update(visible=True), gr.update(value=None, visible=False),
-                new_points, new_labels, box_state, empty,
-                f"已撤销，剩余 {len(new_points)} 个标记")
+                new_points, new_labels, box_state, False,
+                f"已撤销，剩余 {len(new_points)} 个标记", gr.update(), gr.update())
     except Exception as e:
         return (image, gr.update(visible=False), gr.update(value=None, visible=False),
-                new_points, new_labels, box_state, empty, f"撤销失败: {e}")
+                new_points, new_labels, box_state, False, f"撤销失败: {e}",
+                gr.update(), gr.update())
 
 
 def on_clear_points(image, request: gr.Request = None):
-    empty = _ensure_auto_choice({"selected": [], "excluded": []})
     if image is None:
         return (None, gr.update(visible=False), gr.update(value=None, visible=False),
-                [], [], None, [], empty, "", "请先上传图片")
+                [], [], None, [], None, False, "", "请先上传图片", None, None)
     _reset_session_sam_interaction_state(request)
     return (None, gr.update(visible=False), gr.update(value=None, visible=False),
-            [], [], None, [], empty, "", "标记和文本定位已清除")
+            [], [], None, [], None, False, "", "标记和文本定位已清除", None, None)
 
 
 def on_engine_mode_change(image, request: gr.Request = None):
     _clear_session_sam_contexts(request)
-    empty = _ensure_auto_choice({"selected": [], "excluded": []})
     if image is None:
         return (None, gr.update(visible=False), gr.update(value=None, visible=False),
-                [], [], None, [], empty, "", "请先上传图片")
+                [], [], None, [], None, False, "", "请先上传图片", None, None)
     return (None, gr.update(visible=False), gr.update(value=None, visible=False),
-            [], [], None, [], empty, "", "引擎已切换，请重新标记")
+            [], [], None, [], None, False, "", "引擎已切换，请重新标记", None, None)
 
 
 def clear_result_preview_on_start(source, result):

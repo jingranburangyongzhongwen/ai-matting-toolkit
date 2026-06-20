@@ -10,7 +10,26 @@ import torch
 from PIL import Image
 from transformers import AutoModelForImageSegmentation
 
+from log import get_logger
 from .rgba_postprocess import make_clean_rgba
+
+logger = get_logger(__name__)
+
+_RMBG_CANVAS = 1024
+_ASPECT_THRESHOLD = 1.5
+
+
+def _rmbg_pad_params(w: int, h: int) -> dict | None:
+    """Return padding params for extreme-aspect images, or None for direct resize."""
+    aspect = max(w, h) / max(min(w, h), 1)
+    if aspect <= _ASPECT_THRESHOLD:
+        return None
+    scale = _RMBG_CANVAS / max(w, h)
+    new_w = max(int(round(w * scale)), 1)
+    new_h = max(int(round(h * scale)), 1)
+    pad_x = (_RMBG_CANVAS - new_w) // 2
+    pad_y = (_RMBG_CANVAS - new_h) // 2
+    return {"new_w": new_w, "new_h": new_h, "pad_x": pad_x, "pad_y": pad_y}
 
 
 class RMBG2Engine:
@@ -27,7 +46,7 @@ class RMBG2Engine:
         with self._load_lock:
             if self.model is not None:
                 return
-            print(f"[RMBG-2.0] loading model on {self.device} ...")
+            logger.info("loading model on %s ...", self.device)
             self.model = AutoModelForImageSegmentation.from_pretrained(
                 self.model_path,
                 trust_remote_code=True,
@@ -37,8 +56,8 @@ class RMBG2Engine:
             if torch.cuda.is_available():
                 allocated = torch.cuda.memory_allocated() / 1024**3
                 reserved = torch.cuda.memory_reserved() / 1024**3
-                print(f"[VRAM] RMBG-2.0 loaded - allocated: {allocated:.2f}GB, reserved: {reserved:.2f}GB")
-            print("[RMBG-2.0] model loaded")
+                logger.info("VRAM: allocated=%.2fGB, reserved=%.2fGB", allocated, reserved)
+            logger.info("model loaded")
 
     def remove_background(self, image: Image.Image, refiner, transparent_detector=None,
                           refine_mode: str = "auto", debug_dir: str = None) -> Image.Image:
@@ -57,7 +76,7 @@ class RMBG2Engine:
                 else:
                     result = self.model(img_input)
             mask_raw = self._postprocess(result, image.size)
-        print(f"[RMBG-2.0] inference time {time.perf_counter() - t0:.2f}s")
+        logger.info("inference time %.2fs", time.perf_counter() - t0)
 
         img_array = np.array(image.convert("RGB"))
         mask_clean = self._clean_mask(mask_raw)
@@ -79,7 +98,7 @@ class RMBG2Engine:
 
         if debug_dir:
             self._dump_stats("后处理输入alpha", mask)
-            print(f"[诊断] 中间结果已保存到: {debug_dir}")
+            logger.debug("中间结果已保存到: %s", debug_dir)
 
         rgba = make_clean_rgba(
             img_array,
@@ -103,7 +122,7 @@ class RMBG2Engine:
                 else:
                     result = self.model(img_input)
             alpha = self._postprocess(result, image.size)
-        print(f"[RMBG-2.0] ROI inference time {time.perf_counter() - t0:.2f}s")
+        logger.info("ROI inference time %.2fs", time.perf_counter() - t0)
 
         if clean:
             alpha = self._clean_mask(alpha)
@@ -113,7 +132,23 @@ class RMBG2Engine:
 
     def _preprocess(self, image: Image.Image) -> torch.Tensor:
         import torchvision.transforms.functional as TF
-        img = image.convert("RGB").resize((1024, 1024), Image.LANCZOS)
+        w, h = image.size
+        pad = _rmbg_pad_params(w, h)
+        if pad is None:
+            img = image.convert("RGB").resize((_RMBG_CANVAS, _RMBG_CANVAS), Image.LANCZOS)
+        else:
+            arr = np.array(image.convert("RGB").resize((pad["new_w"], pad["new_h"]), Image.LANCZOS))
+            canvas = np.zeros((_RMBG_CANVAS, _RMBG_CANVAS, 3), dtype=np.uint8)
+            px, py = pad["pad_x"], pad["pad_y"]
+            nw, nh = pad["new_w"], pad["new_h"]
+            canvas[py:py + nh, px:px + nw] = arr
+            if py > 0:
+                canvas[:py, px:px + nw] = arr[0:1, :, :]
+                canvas[py + nh:, px:px + nw] = arr[-1:, :, :]
+            if px > 0:
+                canvas[:, :px] = canvas[:, px:px + 1]
+                canvas[:, px + nw:] = canvas[:, px + nw - 1:px + nw]
+            img = Image.fromarray(canvas)
         img_tensor = TF.to_tensor(img).unsqueeze(0)
         mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
         std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
@@ -130,7 +165,13 @@ class RMBG2Engine:
         if output.dim() == 3:
             output = output.squeeze(0)
         mask = torch.sigmoid(output.cpu()).float().numpy()
-        mask = cv2.resize(mask, orig_size, interpolation=cv2.INTER_LINEAR)
+        w, h = orig_size
+        pad = _rmbg_pad_params(w, h)
+        if pad is not None:
+            px, py = pad["pad_x"], pad["pad_y"]
+            nw, nh = pad["new_w"], pad["new_h"]
+            mask = mask[py:py + nh, px:px + nw]
+        mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_LINEAR)
         return (mask * 255).clip(0, 255).astype(np.uint8)
 
     @staticmethod
@@ -147,8 +188,9 @@ class RMBG2Engine:
         # 最大连通域面积
         n, _, stats, _ = cv2.connectedComponentsWithStats((alpha > 127).astype(np.uint8))
         largest = stats[1:, cv2.CC_STAT_AREA].max() if n > 1 else 0
-        print(f"[诊断] {name}: {w}x{h} | bg={bg:.1f}% fg={fg:.1f}% edge={edge:.1f}% | "
-              f"mean={mean_a:.0f} edge_std={edge_std:.1f} | 最大前景连通域={largest}px")
+        logger.debug("%s: %dx%d | bg=%.1f%% fg=%.1f%% edge=%.1f%% | "
+                     "mean=%.0f edge_std=%.1f | 最大连通域=%dpx",
+                     name, w, h, bg, fg, edge, mean_a, edge_std, largest)
 
     @staticmethod
     def _clean_mask(alpha: np.ndarray) -> np.ndarray:

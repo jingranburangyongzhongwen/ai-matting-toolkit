@@ -2,7 +2,7 @@
 import gradio as gr
 
 from model_manager import VITMATTE_VARIANTS, VITMATTE_PROCESS_MODES
-from app_logic.tab2 import ENGINE_MODE_MAP, TAB2_OUTPUT_MODES, _ensure_auto_choice
+from app_logic.tab2 import ENGINE_MODE_MAP, TAB2_OUTPUT_MODES
 
 
 # 中栏上传文案（Tab 1 / Tab 2 共用）
@@ -614,7 +614,7 @@ def build_tab1_ui():
                 )
                 comps["auto_result_img"] = gr.Image(
                     label="效果预览", interactive=False, visible=True,
-                    buttons=[], elem_classes="checkerboard",
+                    buttons=[], elem_classes="checkerboard", format="png",
                 )
                 comps["preview_actions"] = gr.Row(
                     elem_classes="preview-actions", visible=True,
@@ -758,7 +758,7 @@ def build_tab2_ui():
                 )
                 comps["result_img"] = gr.Image(
                     label="选区预览", interactive=False, buttons=[],
-                    elem_classes="checkerboard",
+                    elem_classes="checkerboard", format="png",
                 )
                 comps["canvas_preview_actions"] = gr.Row(
                     elem_classes="preview-actions", visible=True,
@@ -805,7 +805,10 @@ def build_tab2_ui():
         comps["labels_state"] = gr.State([])
         comps["box_state"] = gr.State(None)
         comps["auto_masks_state"] = gr.State([])
-        comps["auto_choice_state"] = gr.State(_ensure_auto_choice({"selected": [], "excluded": []}))
+        comps["image_id_state"] = gr.State(None)
+        comps["auto_select_mode"] = gr.State(False)
+        comps["selected_auto_mask"] = gr.State(None)
+        comps["selected_auto_indices"] = gr.State([])
         comps["canvas_original_rgb_state"] = gr.State(None)
         comps["canvas_auto_rgba_state"] = gr.State(None)
         comps["canvas_current_rgba_state"] = gr.State(None)

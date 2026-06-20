@@ -11,6 +11,10 @@ import numpy as np
 import torch
 from PIL import Image
 
+from log import get_logger
+
+logger = get_logger(__name__)
+
 
 TRANSPARENT_CAPTION = "glass. lens. crystal. diamond. bubble. bulb. web. grid."
 
@@ -34,7 +38,7 @@ class GroundingDinoDetector:
                 return
             from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
             local_path = self._ensure_local(self.model_path)
-            print(f"[Grounding-DINO] loading model on {self.device} ...")
+            logger.info("[Grounding-DINO] loading model on %s ...", self.device)
             self.processor = AutoProcessor.from_pretrained(local_path)
             self.model = AutoModelForZeroShotObjectDetection.from_pretrained(local_path)
             self.model.to(self.device)
@@ -42,8 +46,8 @@ class GroundingDinoDetector:
             if torch.cuda.is_available():
                 allocated = torch.cuda.memory_allocated() / 1024**3
                 reserved = torch.cuda.memory_reserved() / 1024**3
-                print(f"[VRAM] Grounding-DINO loaded - allocated: {allocated:.2f}GB, reserved: {reserved:.2f}GB")
-            print("[Grounding-DINO] model loaded")
+                logger.info("[VRAM] Grounding-DINO loaded - allocated: %.2fGB, reserved: %.2fGB", allocated, reserved)
+            logger.info("[Grounding-DINO] model loaded")
 
     @classmethod
     def _ensure_local(cls, path: str) -> str:
@@ -53,10 +57,10 @@ class GroundingDinoDetector:
         )
         if weights_exist:
             return path
-        print(f"[Grounding-DINO] 本地模型不完整，下载 {cls.HF_REPO} 到 {path} ...")
+        logger.info("[Grounding-DINO] 本地模型不完整，下载 %s 到 %s ...", cls.HF_REPO, path)
         from huggingface_hub import snapshot_download
         snapshot_download(repo_id=cls.HF_REPO, local_dir=path)
-        print("[Grounding-DINO] 下载完成")
+        logger.info("[Grounding-DINO] 下载完成")
         return path
 
     def detect(
@@ -105,7 +109,7 @@ class GroundingDinoDetector:
             boxes = [boxes[i] for i in order]
             if has_scores:
                 scores = [scores[i] for i in order]
-        print(f"[Grounding-DINO] 检测耗时 {time.perf_counter() - t0:.2f}s，命中 {len(boxes)} 个框")
+        logger.info("[Grounding-DINO] 检测耗时 %.2fs，命中 %d 个框", time.perf_counter() - t0, len(boxes))
         if return_scores:
             return boxes, scores
         return boxes

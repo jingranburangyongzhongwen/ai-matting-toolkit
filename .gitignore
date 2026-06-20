@@ -3,9 +3,11 @@ models/
 .claude
 .history
 output/
+tmp/
 .vscode/
 dist/
 build/
 .pyi-build/
 *.spec
 .gstack/
+.agents/

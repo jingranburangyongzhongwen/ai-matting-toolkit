@@ -17,7 +17,10 @@ import cv2
 import numpy as np
 from PIL import Image
 
+from log import get_logger
 from engines.rgba_postprocess import build_context, _compute_spill_score, _safe_foreground_seed, _estimate_background_fill
+
+logger = get_logger(__name__)
 
 
 RGB_DISTANCE_MAX = float(np.sqrt(3.0) * 255.0)
@@ -508,10 +511,8 @@ def refine_manual_edge(
     if n_accept == 0:
         diag = {"status": "skipped", "reason": "accept_mask empty", "elapsed_s": time.perf_counter() - t0}
         if verbose or debug_dir:
-            print(
-                "[manual refine] skipped accept=0 "
-                f"screen_conf={float(screen_info.get('screen_conf', 0.0)):.2f}"
-            )
+            logger.debug("skipped accept=0 screen_conf=%.2f",
+                         float(screen_info.get('screen_conf', 0.0)))
         return current_rgba.copy(), diag
 
     # 3. ViTMatte refinement (optional — often changes alpha too little)
@@ -698,21 +699,17 @@ def refine_manual_edge(
                     f" rejected_rgb_improve={diag.get('rejected_rgb_improve_pct', 0.0):.1f}%"
                     f" reason={rollback_rgb_reason}"
                 )
-            print(f"[manual refine] residue gte240: "
-                  f"{diag['residue_before_by_alpha'].get('gte240', 0):.3f} -> "
-                  f"{diag['residue_after_by_alpha'].get('gte240', 0):.3f} "
-                  f"rgb_improve={diag.get('rgb_improve_pct', 0.0):.1f}%"
-                  f"{rejected}")
-        print(
-            "[manual refine] "
-            f"elapsed={elapsed:.2f}s accept={n_accept}px "
-            f"screen_conf={diag['screen_conf']:.2f} "
-            f"rgb_conf={diag['rgb_conf_mean']:.2f} "
-            f"rollback_rgb={rollback_rgb} "
-            f"alpha_written={diag['alpha_written']} rollback_alpha={rollback_alpha} "
-            f"accept_solid_loss={accept_solid_loss*100:.2f}% "
-            f"accept_alpha_l1={accept_alpha_l1:.3f} "
-            f"unpainted_alpha_l1={unpainted_alpha_l1:.4f}"
+            logger.debug("residue gte240: %.3f -> %.3f rgb_improve=%.1f%%%s",
+                         diag['residue_before_by_alpha'].get('gte240', 0),
+                         diag['residue_after_by_alpha'].get('gte240', 0),
+                         diag.get('rgb_improve_pct', 0.0), rejected)
+        logger.debug(
+            "elapsed=%.2fs accept=%dpx screen_conf=%.2f rgb_conf=%.2f "
+            "rollback_rgb=%s alpha_written=%s rollback_alpha=%s "
+            "accept_solid_loss=%.2f%% accept_alpha_l1=%.3f unpainted_alpha_l1=%.4f",
+            elapsed, n_accept, diag['screen_conf'], diag['rgb_conf_mean'],
+            rollback_rgb, diag['alpha_written'], rollback_alpha,
+            accept_solid_loss * 100, accept_alpha_l1, unpainted_alpha_l1,
         )
 
     if debug_dir:

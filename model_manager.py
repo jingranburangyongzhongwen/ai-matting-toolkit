@@ -6,6 +6,10 @@ import os
 import sys
 import threading
 
+from log import get_logger
+
+logger = get_logger(__name__)
+
 
 def _torch():
     import torch
@@ -59,7 +63,7 @@ def clear_gpu_cache():
         torch.cuda.ipc_collect()
         allocated = torch.cuda.memory_allocated() / 1024**3
         reserved = torch.cuda.memory_reserved() / 1024**3
-        print(f"[VRAM] cache cleared — allocated: {allocated:.2f}GB, reserved: {reserved:.2f}GB")
+        logger.info("VRAM cache cleared — allocated: %.2fGB, reserved: %.2fGB", allocated, reserved)
 
 
 def log_vram(tag: str = ""):
@@ -68,7 +72,7 @@ def log_vram(tag: str = ""):
     if torch.cuda.is_available():
         allocated = torch.cuda.memory_allocated() / 1024**3
         reserved = torch.cuda.memory_reserved() / 1024**3
-        print(f"[VRAM {tag}] allocated: {allocated:.2f}GB, reserved: {reserved:.2f}GB")
+        logger.info("VRAM %s: allocated: %.2fGB, reserved: %.2fGB", tag, allocated, reserved)
 
 
 ENGINE_CONFIGS = {

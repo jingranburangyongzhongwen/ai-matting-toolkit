@@ -13,6 +13,16 @@
 - **原图中栏** — 两 Tab 中栏均支持点击上传与 **Ctrl+V 粘贴**剪贴板图片；换图须先点「清空原图区」（预览显示后上传入口会从页面卸载，无法直接覆盖）
 - **显存管理** — 模型按需加载、用完可卸，减轻显卡压力；默认适合单人使用、尽量省显存；多人同时开多个浏览器页时，每人选区分开保存，并限制「同时处理几张」和排队人数，避免显卡一次占满
 
+## 为什么选它
+
+云端工具上传即抠但素材要离开本机、少有专业去色边与可控选区；桌面专业软件效果强但手动、批量繁琐、上手有门槛。本工具把两者长处合到一起：
+
+- **本地离线、全自动批量** — 全链路本机推理，无需联网上传；多图拖入自动出图，不必逐张手动或录制动作。
+- **自动全色幕去色边 + 过切回滚** — 绿 / 蓝 / 红等纯色幕自动诊断并清除色溢出（高 alpha 残留实测清除率约 99.4%–99.9%）；后处理若把边修得更差会自动回滚，避免越修越糟。
+- **可控精细选区** — 点选 / 框选 / 中英文文本定位（SAM + RMBG 融合），需要时能精确指定主体与边界。
+
+> 发丝、半透明等效果对标商业 SOTA，同时补齐它们普遍缺的本地离线、自动去色边与可控选区。
+
 ## 功能说明
 
 ### 处理流程
@@ -87,87 +97,67 @@ flowchart TB
 
 **读图说明**
 
-- 模式一 **直出**：RMBG → 清理/平滑 → 后处理；不跑 ViTMatte，也不调用 Grounding-DINO。
-- 模式一 **ViTMatte 精修**：在 RMBG alpha 上内部生成窄 unknown trimap 再精修；若同时勾选「检测透明物体」，DINO 用于修正 trimap（非直出路径）。
-- 模式一勾选「检测透明物体」且为直出时：仅在后处理阶段加强半透明保护，**不跑 DINO 检测**。
-- 模式二 **不走 ViTMatte**；输出二选一：**SAM严格**（纯 SAM 二值硬边界，不调 RMBG，最快）或 **RMBG精修**（SAM 定主体，ROI 内 RMBG + 约束融合，默认推荐）。低显存下 SAM-HQ 与 RMBG 可能同时驻留，建议 ≥8GB 显存或优先 MobileSAM。
-- 两种模式导出前都会走自动 RGB 去色边：使用 alpha 外侧背景 seed 估计局部背景方向，只在背景可信且边缘确有背景色残留时修正；透明保护区与细节区保持保守。
-- 默认 **单 session 低显存**；多人/多标签页加 `--multi-session`（每页独立 SAM predictor / embedding / 点击先验，SAM 会话 LRU，默认最多 8 个）。
+- **模式一**：直出 = RMBG → 清理/平滑 → 后处理（不跑 ViTMatte / DINO）；ViTMatte 精修则在 RMBG alpha 上生成窄 unknown trimap 再精修。勾「检测透明物体」时，直出仅在后处理加强半透明保护、不跑 DINO，ViTMatte 路径才用 DINO 修正 trimap。
+- **模式二**：不走 ViTMatte，输出二选一——**SAM严格**（纯 SAM 二值硬边界，最快，默认选中）或 **RMBG精修**（SAM 定主体 + ROI 内 RMBG 约束融合，软边/发丝等场景更好，硬边未必优于严格）。低显存下 SAM-HQ 与 RMBG 可能同时驻留，建议 ≥8GB 或优先 MobileSAM。
+- **共用**：导出前自动 RGB 去色边（按 alpha 外侧背景 seed 估计方向，仅在背景可信且确有残留时修正，透明区保守处理）；默认单 session 低显存，多人 / 多标签页加 `--multi-session`（每页独立 SAM 状态，LRU 默认 8 个）。
 
 ### 原图上传（两 Tab 中栏）
 
-- **点击上传** 或 **Ctrl+V 粘贴**（焦点需在页面内、且不在文本输入框中）
-- 上传/粘贴成功后在中栏显示原图预览；**更换图片须先点「清空原图区」** 再重新上传或粘贴
-- 一键抠图可选 **单张** / **批量**：单张支持粘贴；批量为多文件选择（不支持粘贴）
+- **点击上传** 或 **Ctrl+V 粘贴**（焦点在页面内、不在文本框中）；成功后中栏显示预览
+- **更换图片须先点「清空原图区」** 再重新上传或粘贴
+- 一键抠图的 **批量** 为多文件选择（不支持粘贴），**单张** 支持粘贴
 
 ### 模式一：一键抠图
 
-1. 打开 **一键抠图** 标签页
-2. 中栏上传或粘贴原图（批量模式可一次选多张）
-3. （可选）勾选「检测透明物体」— 直出时保护半透明区域；配合 ViTMatte 时另用 DINO 修正 trimap
-4. （可选）精修模型：默认直出，或 Small / Base / MatAny
-5. （可选）勾选「保存诊断中间结果」
-6. 点击 **开始抠图** → 结果保存到 `output/`（透明 PNG）
-7. 预览区可 **查看大图** / **下载**；若发丝/边缘有背景色残留，点击 **边缘修复** → 涂抹污染区域 → **应用修复**
+1. 打开 **一键抠图** 标签页，中栏上传或粘贴原图（批量可一次选多张）
+2. （可选）勾「检测透明物体」（直出时保护半透明区，ViTMatte 时用 DINO 修 trimap）、选精修模型（直出 / Base / MatAny / Small，默认直出）、勾「保存诊断中间结果」
+3. 点击 **开始抠图** → 透明 PNG 存到 `output/`
+4. 预览区可 **查看大图** / **下载**；发丝或边缘有背景色残留时点 **边缘修复**
 
 ### 边缘修复（手动发丝去色边）
 
-当 alpha 在发丝边缘接近实心（alpha≈240–255），但 RGB 仍含背景色（绿幕/蓝幕/红幕/黄幕等残留）时，自动后处理 despill 效果有限。此时可使用**边缘修复**（**一键抠图**与**精细选区**共用同一套流程）：
+当发丝边缘 alpha 接近实心（≈240–255）但 RGB 仍含背景色（绿/蓝/红/黄幕残留）时，自动 despill 效果有限。此时用**边缘修复**（两 Tab 共用同一流程）：
 
-1. 抠图完成后，右栏预览区出现 **边缘修复** 按钮
-2. 进入修复模式，用红色画笔涂抹可见的色边区域（支持橡皮擦修正）
-3. 点击 **应用修复** — 系统自动：
-   - 从背景 seed 估计 **screen chroma**（色度平面方向，不绑定绿/蓝某一通道）
-   - 构建 accept_mask（结合 spill score 与 screen spill，仅修复靠近背景的边缘，保护内部与透明材质）
-   - 用 ViTMatte 在 accept 区域重估 alpha（整段 unknown trimap，可恢复「假实心」发丝）
-   - regularized unmix 恢复前景 RGB，screen direction gate 确认色边方向确实被压低
-   - 空间羽化 + 置信度门控合并；若 RGB/alpha 残留指标变差则**自动回滚**（高置信纯色幕优先用 screen 残留度量）
-4. 支持 **撤销**（最多 5 步）/ **重置**（回到自动抠图结果）/ **退出修复**
-5. 换图、重新上传或重新抠图时会自动清空修复状态，避免旧蒙版污染新图
-
-**ViTMatte 变体**：Tab1 跟随「精修模型」选项（直出时内部回退为 Base）；Tab2 固定使用 Base。
+1. 抠图后右栏出现 **边缘修复** 按钮；进入后用红色画笔涂抹色边区域（可橡皮擦修正）
+2. 点击 **应用修复**，系统按下方流程自动重估发丝 alpha、去色边，残留变差时回滚保护
+3. 支持 **撤销**（最多 5 步）/ **重置**（回自动结果）/ **退出修复**；换图或重新抠图时自动清空修复状态
 
 ```
-用户涂抹 → accept_mask (+ screen spill) → spill-aware trimap → ViTMatte alpha
-  → regularized unmix → direction gate → 残留诊断 → 安全合并 / 回滚
+涂抹 → accept_mask (+ screen spill) → spill-aware trimap → ViTMatte 重估 alpha
+  → regularized unmix → 方向门控 → 残留诊断 → 安全合并 / 回滚
 ```
 
-**本地测试**（无需启动 UI，18 项合成回归，覆盖多纯色幕、回滚保护与羽化稳定性）：
+**ViTMatte 变体**：Tab1 跟随「精修模型」（直出时内部回退 Base），Tab2 固定 Base。
+
+**本地测试**（无需 UI，18 项合成回归，覆盖多纯色幕、回滚保护与羽化稳定性）：
 
 ```bash
-python scripts/test_manual_refine.py
-# 可选：保存每 case 诊断图
-python scripts/test_manual_refine.py --debug-dir output/_test_manual
+python scripts/test_manual_refine.py            # 加 --debug-dir output/_test_manual 保存每 case 诊断图
 ```
 
 ### 直出 vs ViTMatte 精修
 
 | 主体类型 | 推荐 |
 |---|---|
-| 硬边（产品、硬轮廓） | **直出**，速度最快 |
-| 软边（发丝、毛绒、运动模糊） | **ViTMatte**，重建 alpha 过渡 |
+| 硬边（产品、硬轮廓） | **直出**（RMBG + 后处理），最快，通常已足够 |
+| 软边（发丝、毛绒、运动模糊） | **ViTMatte**，重建 alpha 过渡，收益最大 |
 
-- **直出** = RMBG + 后处理；硬边场景通常已足够。
-- **ViTMatte** 在硬边上最多追平直出，软边/细节主体收益最大。
-- **变体**：Small（省显存）/ Base（更准）/ MatAny（需额外权重）
-- **推理模式**：条带（省显存）/ 主体 / 边缘
-- ViTMatte 使用模型原生注意力（window+global），不用 strided 近似。
+- **变体**：Small（省显存）/ Base（更准）/ MatAny（需额外权重）；**推理模式**：条带（省显存）/ 主体 / 边缘。
+- ViTMatte 用模型原生注意力（window+global），不用 strided 近似。
 
 ### 模式二：精细选区
 
 1. 打开 **精细选区** 标签页，中栏上传或粘贴单张原图
-2. 三种方式获取选区（可混用）：
-   - **直接点图** — 正向/负向点选，SAM 实时预览
-   - **文本定位** — 输入描述（如 `goose`），DINO 自动框选 → SAM 分割
-   - **检测** — SAM 自动识别全部候选主体，点选/排除
-3. 继续打点精修直到满意
-4. 选择 **输出模式**：
-   - **SAM严格** — SAM 二值硬边界 + 负向点，不调用 RMBG，最快、边界最贴 SAM
-   - **RMBG精修** — SAM 定主体，RMBG 在 ROI 内融合 alpha（默认推荐，高质量路径）
-5. （可选）「保护透明/半透明材质」— 后处理保留物体内部软 alpha
-6. （可选）「保存诊断中间结果」
-7. 点击 **开始抠图** → RGBA 后处理 → 保存到 `output/`
-8. 预览区可 **查看大图** / **下载**；色边残留时同样可进入 **边缘修复**（流程与 Tab1 相同，ViTMatte 固定 Base）
+2. 选 **引擎模式**：**高精度**（SAM-HQ，默认）或 **快速**（MobileSAM）
+3. 获取选区（三种可混用），继续打点精修至满意：
+   - **直接点图** — 正/负向点选，SAM 实时预览
+   - **文本定位** — 输入描述（如 `goose`），DINO 框选 → SAM 分割
+   - **自动分割** — SAM 自动列出候选主体，点选 / 排除
+   - 打点过程可 **撤销**（回退上一步标记）/ **清除标记**（清空全部点与选区）
+4. 选 **输出模式**：**SAM严格**（二值硬边界 + 负向点，不调 RMBG，最快、最贴 SAM，默认选中）或 **RMBG精修**（SAM 定主体 + ROI 内 RMBG 融合，软边/发丝等场景更好，硬边未必优于严格）
+5. （可选）「保护透明/半透明材质」、「保存诊断中间结果」
+6. 点击 **开始抠图** → RGBA 后处理 → 存到 `output/`
+7. 预览区可 **查看大图** / **下载**；色边残留时进入 **边缘修复**（流程同 Tab1，ViTMatte 固定 Base）
 
 ## 项目结构
 
@@ -175,6 +165,7 @@ python scripts/test_manual_refine.py --debug-dir output/_test_manual
 ai-matting-toolkit/
 ├── app.py                 # 入口：初始化、Tab1 回调、UI 构建、CLI
 ├── model_manager.py       # 模型懒加载、设备与路径
+├── log.py                 # 日志模块（MATTING_LOG_LEVEL 控制级别）
 ├── app_logic/
 │   ├── tab2.py            # Tab2 全部后端：SAM 会话、box 几何、预测、overlay、alpha 生成、回调
 │   └── refine.py          # 手动边缘修复回调（Tab1 / Tab2 共用）
@@ -187,15 +178,20 @@ ai-matting-toolkit/
 │   ├── rgba_postprocess.py# 拓扑感知 RGBA 后处理（两 Tab 共用出口）
 │   ├── rgb_defringe.py    # 背景方向去色边 + screen despill
 │   ├── manual_refine.py   # 涂抹式边缘修复管线
-│   ├── mobile_sam.py      # MobileSAM 交互
-│   ├── sam_hq.py          # SAM-HQ
-│   └── grounding_dino.py  # 文本定位
+│   ├── sam_session.py     # SAM 会话基类：embedding 缓存、交互/批量预测、自动分割、auto-mask 优化
+│   ├── mobile_sam.py      # MobileSAM 加载封装
+│   ├── sam_hq.py          # SAM-HQ 加载封装
+│   └── grounding_dino.py  # 文本定位 / 透明物体检测
 ├── scripts/
+│   ├── benchmark.py            # 端到端质量回归测试（Tab1 + Tab2 双引擎，含 LPIPS / SAD 等指标）
 │   ├── test_manual_refine.py   # 边缘修复回归测试
-│   └── verify_rgb_defringe.py  # RGB 去色边诊断（无需加载模型）
+│   ├── test_postprocess.py     # RGBA 后处理 + defringe 测试
+│   ├── test_rmbg_cleanup.py    # RMBG 连通域清理测试
+│   └── test_sam_strict_alpha.py# SAM strict alpha band 测试
 ├── models/                # 权重目录（见下文）
 ├── output/                # 导出 PNG 与可选 _debug 诊断
-└── build.bat              # PyInstaller 打包
+├── build.py               # PyInstaller 打包（跨平台 Python 入口）
+├── _build_spec.py         # 动态生成优化 .spec 文件
 ```
 
 ## 开发环境
@@ -214,10 +210,24 @@ pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 RGBA 后处理不依赖额外 matting solver；RGB 去色边基于 OpenCV/Numpy 的局部背景方向抑制。可不加载模型，先验证后处理诊断链路：
 
 ```bash
-python scripts/verify_rgb_defringe.py
+python scripts/test_postprocess.py
 ```
 
 边缘修复回归测试见上文「边缘修复」一节（需 ViTMatte，GPU 约 0.5s/case）。
+
+### 端到端质量回归测试
+
+改动代码后自动检测是否引入质量回归，覆盖 Tab1（RMBG-2.0）+ Tab2（MobileSAM + SAM-HQ）双引擎：
+
+```bash
+# 首次：准备测试图片目录（放几张代表性图片），保存基线
+python scripts/benchmark.py save --input test_images
+
+# 改动代码后：对比基线，自动报告回归
+python scripts/benchmark.py compare --input test_images
+```
+
+评测分层：模型输出（raw alpha 分布/边缘）→ 后处理效果（solid loss / 前景保留度）→ 最终输出（合成溢色检测）。只需 `test_images/` 下放原图，不需手动准备其他数据。
 
 ### 运行
 
@@ -247,6 +257,7 @@ MATTING_PRELOAD_RMBG=0 python app.py
 | `--max-sam-sessions` | 多 session 下 SAM 缓存上限（默认 `8`，LRU 回收） |
 | `--model-concurrency` | GPU 推理并发槽；默认单 session 为 `1`，多 session 为 `2` |
 | `--queue-size` | 等待队列长度（默认 `32`） |
+| `--feedback-url` | 反馈问题的超链接地址，显示在标题旁（默认无） |
 
 示例（本机多人、限并发）：
 
@@ -261,6 +272,7 @@ python app.py --multi-session --max-sam-sessions 8 --model-concurrency 2 --queue
 | `MATTING_PRELOAD_RMBG` | `1` | 启动时后台预热 RMBG-2.0；设为 `0` 关闭 |
 | `MATTING_AGGRESSIVE_UNLOAD` | 单 session `1` / 多 session `0` | 任务间更积极卸载未用模型以省显存；显式设为 `1` 可强制启用（单 session 默认已开） |
 | `MATTING_STARTUP_LOG` | `1` | 打印分阶段启动耗时；设为 `0` 关闭 |
+| `MATTING_LOG_LEVEL` | `INFO` | 日志级别（如 `DEBUG` / `INFO` / `WARNING`） |
 | `MANUAL_REFINE_DEBUG` | 未设置 | 设为任意非空值时，边缘修复打印详细诊断（等同勾选诊断保存时的 verbose） |
 
 ### 下载模型
@@ -310,38 +322,14 @@ curl -L -o models/mobile_sam/mobile_sam.pt https://ghproxy.com/https://github.co
 ### 打包为 exe
 
 ```bash
-build.bat
+python build.py
+python build.py --no-models    # 跳过模型复制，快速迭代
+python build.py --clean        # 构建前强制清理旧中间目录
 ```
 
-产物目录：`dist/全自动抠图/`（`全自动抠图.exe` + `_internal/` + 可选 `models/`）。PyInstaller 缓存写在 `.pyi-build/`，结束后自动清理。
+产物目录：`dist/全自动抠图/`（`全自动抠图.exe` + `_internal/` + 可选 `models/`）。默认保留 PyInstaller 中间目录以加速增量打包，构建成功后自动清理、失败时保留以便排查；`--clean` 可在构建前强制清理。若被杀毒拦截，将整个 `dist/全自动抠图/` 文件夹加入白名单。
 
-`pyinstaller-hooks/hook-kornia.py` 将 kornia 以源码打入包内，避免 exe 中 `torch.jit.script` 因缺源码失败。
-
-## 常见问题
-
-**Q: 浏览器没有自动打开？**  
-A: 访问 http://127.0.0.1:18181（或 `-p` 指定端口）
-
-**Q: 局域网多人怎么用？**  
-A: 默认仅 `127.0.0.1`。多人/多标签页请加 `--multi-session`；超出 `--max-sam-sessions` 后 LRU 回收最久未用的 SAM 缓存。
-
-**Q: 如何退出？**  
-A: 关闭控制台窗口或 `Ctrl+C`；只关浏览器标签不会结束服务。
-
-**Q: 杀毒拦截？**  
-A: 将整个 `dist/全自动抠图/` 文件夹加入白名单。
-
-**Q: 很慢？**  
-A: 首次加载模型较慢；建议使用 NVIDIA GPU。单 session 会在任务间卸载未用模型以省显存。
-
-**Q: 支持哪些格式？**  
-A: JPG、PNG、BMP、WEBP、TIFF
-
-**Q: Ctrl+V 粘贴没反应？**  
-A: 确保焦点不在左侧状态框或文本定位输入框内；粘贴的是图片而非纯文本。已有预览时须先点「清空原图区」再粘贴。
-
-**Q: 为什么换图要先清空？**  
-A: 预览显示后 Gradio 6 会卸载上传组件，粘贴/上传入口不再存在，故需先清空再载入新图。
+`pyinstaller-hooks/` 下的自定义 hook 将 `torchvision`、`mobile_sam`、`segment_anything_hq`、`kornia` 以 `pyz+py` 模式打入包内，保留 `.py` 源码供 `torch.load` / `torch.jit.script` 反序列化使用。
 
 ## 技术栈
 
