@@ -1,5 +1,6 @@
 # ── UI 布局 + CSS/JS ─────────────────────────────────────────────
 import gradio as gr
+import numpy as np
 
 from model_manager import VITMATTE_VARIANTS, VITMATTE_PROCESS_MODES
 from app_logic.tab2 import ENGINE_MODE_MAP, TAB2_OUTPUT_MODES
@@ -11,6 +12,11 @@ SOURCE_SECTION_HTML = (
     '<span class="section-hint">支持点击上传或 Ctrl+V 粘贴</span></div>'
 )
 SOURCE_UPLOAD_LABEL = "上传或粘贴图片"
+EMPTY_EDITOR_VALUE = {
+    "background": np.zeros((1, 1, 4), dtype=np.uint8),
+    "layers": [],
+    "composite": np.zeros((1, 1, 4), dtype=np.uint8),
+}
 
 
 # ── CSS ──────────────────────────────────────────────────────────
@@ -146,6 +152,7 @@ body {
     width: 100% !important;
     min-width: 0 !important;
 }
+/* Empty preview height is synchronized by APP_JS only while both panels are empty. */
 .checkerboard img,
 .checkerboard canvas {
     display: block !important;
@@ -221,10 +228,28 @@ body.image-lightbox-open { overflow: hidden; }
     margin-top: 8px;
     display: flex;
     justify-content: flex-end;
+    align-items: center;
+    gap: 8px;
+    background: transparent !important;
+    border: 0 !important;
+    box-shadow: none !important;
+    padding: 0 !important;
+}
+.preview-actions > div,
+.preview-actions .form,
+.preview-actions fieldset {
+    background: transparent !important;
+    border: 0 !important;
+    box-shadow: none !important;
+    padding: 0 !important;
 }
 .preview-actions button,
 .preview-open-btn button {
     font-size: 0.84em !important;
+}
+.preview-actions.result-ready:not(.hide) .result-download-btn.hidden {
+    display: flex !important;
+    visibility: visible !important;
 }
 
 /* 左栏按钮行：紧凑并排 */
@@ -346,6 +371,7 @@ input[type="checkbox"] { accent-color: var(--blue); }
 }
 .refine-editor canvas {
     width: 100% !important;
+    height: 100% !important;
     max-height: 100% !important;
     object-fit: contain !important;
     border-radius: var(--radius) !important;
@@ -452,11 +478,197 @@ APP_JS = """
 
     const activeTabPanel = () => {
         const panels = [...document.querySelectorAll('[role="tabpanel"]')];
-        // 未隐藏（display:none 的元素 offsetParent 为 null）的面板即当前 Tab
+        // Active Gradio tab panel is the one that still participates in layout.
         return panels.find((p) => p.offsetParent !== null) || panels[0] || null;
     };
+    const isElementVisible = (el) => {
+        if (!el) return false;
+        const cs = getComputedStyle(el);
+        return el.offsetParent !== null
+            && cs.display !== "none"
+            && cs.visibility !== "hidden";
+    };
 
-    // 优先可见上传区；预览显示时上传区可能 display:none 但 file input 仍在 DOM
+    const releaseCollapsedBlock = (el) => {
+        if (!el) return;
+        el.style.removeProperty("height");
+        el.style.removeProperty("min-height");
+        el.style.removeProperty("margin-top");
+        el.style.removeProperty("margin-bottom");
+        el.style.removeProperty("padding-top");
+        el.style.removeProperty("padding-bottom");
+        el.style.removeProperty("overflow");
+    };
+
+    const collapseHiddenBlock = (el) => {
+        if (!el) return;
+        const hidden = !isElementVisible(el) || el.classList.contains("hide");
+        if (!hidden) {
+            releaseCollapsedBlock(el);
+            return;
+        }
+        el.style.setProperty("height", "0", "important");
+        el.style.setProperty("min-height", "0", "important");
+        el.style.setProperty("margin-top", "0", "important");
+        el.style.setProperty("margin-bottom", "0", "important");
+        el.style.setProperty("padding-top", "0", "important");
+        el.style.setProperty("padding-bottom", "0", "important");
+        el.style.setProperty("overflow", "hidden", "important");
+    };
+
+    const isPreviewActionRow = (row) => !!row?.querySelector(".preview-open-btn");
+    const editorActionRow = (card) => [...card.querySelectorAll(".preview-actions")]
+        .find((row) => !isPreviewActionRow(row));
+
+    const alignPanelCards = (middleCard, rightCard, refineActive) => {
+        if (!middleCard || !rightCard || refineActive) {
+            middleCard?.style.removeProperty("min-height");
+            rightCard?.style.removeProperty("min-height");
+            return;
+        }
+        const mh = Math.round(middleCard.getBoundingClientRect().height);
+        const rh = Math.round(rightCard.getBoundingClientRect().height);
+        const target = Math.max(mh, rh);
+        if (Math.abs(mh - rh) > 2) {
+            middleCard.style.minHeight = `${target}px`;
+            rightCard.style.minHeight = `${target}px`;
+        }
+    };
+
+    const syncEmptyPreviewHeights = () => {
+        const panels = [...document.querySelectorAll('[role="tabpanel"]')];
+        for (const panel of panels) {
+            const cards = [...panel.querySelectorAll(".panel-card")];
+            const middleCard = cards[0];
+            const rightCard = cards[1];
+            if (!rightCard) continue;
+
+            const sourceShell = middleCard?.querySelector(
+                ".upload-area, .checkerboard:not(.refine-editor)"
+            );
+            const refineEditor = rightCard.querySelector(":scope > .refine-editor");
+            const refineActive = isElementVisible(refineEditor);
+            for (const row of rightCard.querySelectorAll(".preview-actions")) {
+                if (isPreviewActionRow(row)) {
+                    collapseHiddenBlock(row);
+                }
+            }
+            if (refineActive) {
+                releaseCollapsedBlock(editorActionRow(rightCard));
+            }
+            if (!refineActive) {
+                collapseHiddenBlock(refineEditor);
+            }
+
+            const preview = rightCard.querySelector(":scope > .checkerboard:not(.refine-editor)");
+            const previewActions = [...rightCard.querySelectorAll(".preview-actions")]
+                .find((row) => row.querySelector(".preview-open-btn"));
+            const hasRenderedPreview = !!(preview
+                && isElementVisible(preview)
+                && preview.querySelector("img[src], canvas"));
+            const actionsVisible = isElementVisible(previewActions);
+            previewActions?.classList.toggle(
+                "result-ready",
+                hasRenderedPreview && !refineActive && actionsVisible,
+            );
+
+            const sourceHasRenderedImage = !!middleCard?.querySelector(
+                '.checkerboard:not(.refine-editor) img[src], .checkerboard:not(.refine-editor) canvas, .upload-area img[src], .upload-area canvas'
+            );
+            const empty = preview?.querySelector(':scope > .empty[aria-label="Empty value"]');
+            const previewEmpty = !hasRenderedPreview;
+
+            middleCard?.style.removeProperty("min-height");
+            rightCard.style.removeProperty("min-height");
+
+            if (!preview || !previewEmpty || sourceHasRenderedImage || refineActive) {
+                preview?.style.removeProperty("height");
+                empty?.style.removeProperty("height");
+                empty?.style.removeProperty("min-height");
+            } else {
+                const measureEl = sourceShell;
+                if (measureEl) {
+                    const h = Math.round(measureEl.getBoundingClientRect().height);
+                    if (h > 0) {
+                        preview.style.height = `${h}px`;
+                        if (empty) {
+                            empty.style.height = "100%";
+                            empty.style.minHeight = "0px";
+                        }
+                    }
+                }
+            }
+
+            alignPanelCards(middleCard, rightCard, refineActive);
+        }
+    };
+
+    const clearRefineEditorSize = (editor) => {
+        editor.style.removeProperty("height");
+        const imageBox = editor.querySelector('[data-testid="image"]');
+        imageBox?.style.removeProperty("height");
+        for (const canvas of editor.querySelectorAll("canvas")) {
+            canvas.style.removeProperty("height");
+        }
+    };
+
+    const syncRefineEditorSizes = () => {
+        const panels = [...document.querySelectorAll('[role="tabpanel"]')];
+        for (const panel of panels) {
+            const cards = [...panel.querySelectorAll(".panel-card")];
+            const sourceImage = cards[0]?.querySelector(
+                '.checkerboard:not(.refine-editor) img[src], .checkerboard:not(.refine-editor) canvas, .upload-area img[src], .upload-area canvas'
+            );
+            const editor = cards[1]?.querySelector(":scope > .refine-editor");
+            if (!editor) continue;
+            const visible = isElementVisible(editor);
+            if (!visible) {
+                clearRefineEditorSize(editor);
+                continue;
+            }
+            const sourceHeight = Math.round(sourceImage?.getBoundingClientRect().height || 0);
+            if (sourceHeight <= 0) {
+                clearRefineEditorSize(editor);
+                continue;
+            }
+            const nextHeight = `${sourceHeight}px`;
+            if (editor.style.height !== nextHeight) editor.style.height = nextHeight;
+            const imageBox = editor.querySelector('[data-testid="image"]');
+            if (imageBox && imageBox.style.height !== "100%") imageBox.style.height = "100%";
+            for (const canvas of editor.querySelectorAll("canvas")) {
+                if (canvas.style.height !== "100%") canvas.style.height = "100%";
+            }
+        }
+    };
+
+    let previewSyncRaf = 0;
+    const scheduleEmptyPreviewSync = () => {
+        if (previewSyncRaf) return;
+        previewSyncRaf = requestAnimationFrame(() => {
+            previewSyncRaf = requestAnimationFrame(() => {
+                previewSyncRaf = 0;
+                syncEmptyPreviewHeights();
+                syncRefineEditorSizes();
+            });
+        });
+    };
+
+    if (!window.__mattingPreviewHeightObserver) {
+        window.__mattingPreviewHeightObserver = true;
+        window.addEventListener("load", scheduleEmptyPreviewSync);
+        window.addEventListener("resize", scheduleEmptyPreviewSync);
+        document.addEventListener("click", (event) => {
+            if (event.target.closest('[role="tab"]')) scheduleEmptyPreviewSync();
+        }, true);
+        new MutationObserver(scheduleEmptyPreviewSync).observe(document.body, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ["class", "style", "aria-selected"],
+        });
+        scheduleEmptyPreviewSync();
+    }
+
     const findPasteFileInput = (panel) => {
         const inputs = [...panel.querySelectorAll('.upload-area input[type="file"]')];
         const visible = inputs.find((input) => {
@@ -625,7 +837,8 @@ def build_tab1_ui():
                         elem_classes=["btn-secondary", "preview-open-btn"],
                     )
                     comps["auto_result_download_btn"] = gr.DownloadButton(
-                        "下载", visible=False, elem_classes="btn-secondary",
+                        "下载", visible=False,
+                        elem_classes=["btn-secondary", "result-download-btn"],
                     )
                     comps["enter_refine_btn"] = gr.Button(
                         "边缘修复", visible=False, elem_classes="btn-primary",
@@ -633,12 +846,14 @@ def build_tab1_ui():
 
                 comps["auto_result_editor"] = gr.ImageEditor(
                     label=None, image_mode="RGBA", type="numpy",
+                    value=EMPTY_EDITOR_VALUE,
                     height="68vh", canvas_size=(2048, 2048),
                     brush=gr.Brush(default_size=20, colors=["#ff0000"], color_mode="fixed"),
                     eraser=gr.Eraser(default_size=20),
-                    layers=True, transforms=None,
+                    # Keep layers disabled to avoid Gradio 6 ImageEditor remount issues across tabs.
+                    layers=False, transforms=None,
                     elem_classes=["checkerboard", "refine-editor"],
-                    interactive=True, show_label=False, visible=False,
+                    interactive=True, show_label=False, visible="hidden",
                 )
                 comps["editor_actions"] = gr.Row(
                     elem_classes="preview-actions", visible=False,
@@ -769,19 +984,22 @@ def build_tab2_ui():
                         elem_classes=["btn-secondary", "preview-open-btn"],
                     )
                     comps["result_download_btn"] = gr.DownloadButton(
-                        "下载", visible=False, elem_classes="btn-secondary",
+                        "下载", visible=False,
+                        elem_classes=["btn-secondary", "result-download-btn"],
                     )
                     comps["canvas_enter_refine_btn"] = gr.Button(
                         "边缘修复", visible=False, elem_classes="btn-primary",
                     )
                 comps["canvas_result_editor"] = gr.ImageEditor(
                     label=None, image_mode="RGBA", type="numpy",
+                    value=EMPTY_EDITOR_VALUE,
                     height="68vh", canvas_size=(2048, 2048),
                     brush=gr.Brush(default_size=20, colors=["#ff0000"], color_mode="fixed"),
                     eraser=gr.Eraser(default_size=20),
-                    layers=True, transforms=None,
+                    # Keep layers disabled to avoid Gradio 6 ImageEditor remount issues across tabs.
+                    layers=False, transforms=None,
                     elem_classes=["checkerboard", "refine-editor"],
-                    interactive=True, show_label=False, visible=False,
+                    interactive=True, show_label=False, visible="hidden",
                 )
                 comps["canvas_editor_actions"] = gr.Row(
                     elem_classes="preview-actions", visible=False,

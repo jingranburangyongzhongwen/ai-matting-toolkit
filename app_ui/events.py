@@ -4,7 +4,7 @@ import gradio as gr
 from app_logic import tab2, refine
 from app_logic.refine import (
     _clear_manual_refine_updates, _clear_canvas_manual_refine_updates,
-    _normal_result_title,
+    _empty_editor_value, _normal_result_title,
 )
 
 
@@ -56,7 +56,7 @@ def bind_tab1_events(demo, c, model_concurrency_limit, callbacks):
     )
 
     # 清空原图
-    c["auto_swap_btn"].click(
+    auto_clear = c["auto_swap_btn"].click(
         fn=callbacks["on_auto_clear_source"],
         inputs=[c["upload_mode"]],
         outputs=[c["auto_files"], c["auto_single_img"], c["auto_input_img"], c["auto_input_view_btn"],
@@ -64,8 +64,8 @@ def bind_tab1_events(demo, c, model_concurrency_limit, callbacks):
                  c["auto_result_download_btn"], c["auto_status"]],
         queue=False, show_progress="hidden",
     )
-    c["auto_swap_btn"].click(
-        fn=_clear_manual_refine_updates,
+    auto_clear.then(
+        fn=lambda: _clear_manual_refine_updates(preview_visible=False),
         inputs=[],
         outputs=[c["original_rgb_state"], c["auto_rgba_state"], c["current_rgba_state"],
                  c["edit_history_state"], c["enter_refine_btn"], c["auto_result_editor"],
@@ -80,10 +80,10 @@ def bind_tab1_events(demo, c, model_concurrency_limit, callbacks):
     )
 
     # Reset right column and manual-refine state when starting auto process
-    c["auto_btn"].click(
+    auto_start = c["auto_btn"].click(
         fn=lambda: (gr.update(visible=True), gr.update(visible=True),
-                    gr.update(visible=False), gr.update(visible=False),
-                    gr.update(value=_normal_result_title()),
+                    gr.update(value=_empty_editor_value(), visible="hidden"),
+                    gr.update(visible=False), gr.update(value=_normal_result_title()),
                     None, None, None, [], gr.update(visible=False)),
         inputs=[],
         outputs=[c["auto_result_img"], c["preview_actions"],
@@ -92,7 +92,7 @@ def bind_tab1_events(demo, c, model_concurrency_limit, callbacks):
                  c["edit_history_state"], c["enter_refine_btn"]],
         queue=False, show_progress="hidden",
     )
-    c["auto_btn"].click(
+    auto_start.then(
         fn=callbacks["on_auto_process"],
         inputs=[c["auto_files"], c["auto_single_img"], c["auto_input_img"], c["detect_transparent"],
                 c["vitmatte_variant"], c["process_mode"], c["save_debug"]],
@@ -110,7 +110,9 @@ def bind_tab1_events(demo, c, model_concurrency_limit, callbacks):
         inputs=[c["current_rgba_state"]],
         outputs=[c["auto_result_img"], c["preview_actions"],
                  c["auto_result_editor"], c["editor_actions"],
-                 c["result_title"], c["enter_refine_btn"], c["auto_status"]],
+                 c["result_title"], c["enter_refine_btn"],
+                 c["auto_result_view_btn"], c["auto_result_download_btn"],
+                 c["auto_status"]],
     )
     c["exit_refine_btn"].click(
         fn=refine.on_exit_refine_mode,
@@ -193,7 +195,7 @@ def bind_tab2_events(demo, c, model_concurrency_limit):
                  c["canvas_result_title"]],
         queue=False, show_progress="hidden",
     )
-    c["canvas_swap_btn"].click(
+    canvas_clear = c["canvas_swap_btn"].click(
         fn=tab2.on_canvas_clear_source,
         outputs=[c["canvas_files"], c["canvas_img"], c["canvas_view_btn"],
                  c["canvas_swap_btn"], c["result_view_btn"], c["result_download_btn"],
@@ -203,8 +205,8 @@ def bind_tab2_events(demo, c, model_concurrency_limit):
                  c["selected_auto_indices"]],
         queue=False, show_progress="hidden",
     )
-    c["canvas_swap_btn"].click(
-        fn=_clear_canvas_manual_refine_updates,
+    canvas_clear.then(
+        fn=lambda: _clear_canvas_manual_refine_updates(preview_visible=False),
         inputs=[],
         outputs=[c["canvas_original_rgb_state"], c["canvas_auto_rgba_state"],
                  c["canvas_current_rgba_state"], c["canvas_edit_history_state"],
@@ -274,13 +276,13 @@ def bind_tab2_events(demo, c, model_concurrency_limit):
         concurrency_id="model-gpu",
     )
 
-    c["generate_btn"].click(
+    generate_start = c["generate_btn"].click(
         fn=tab2.clear_result_preview_on_start,
         inputs=[c["canvas_img"], c["result_img"]],
         outputs=[c["result_img"], c["result_view_btn"], c["result_download_btn"]],
         queue=False, show_progress="hidden",
     )
-    c["generate_btn"].click(
+    generate_start = generate_start.then(
         fn=_clear_canvas_manual_refine_updates,
         inputs=[],
         outputs=[c["canvas_original_rgb_state"], c["canvas_auto_rgba_state"],
@@ -290,7 +292,7 @@ def bind_tab2_events(demo, c, model_concurrency_limit):
                  c["canvas_result_title"]],
         queue=False, show_progress="hidden",
     )
-    c["generate_btn"].click(
+    generate_start.then(
         fn=tab2.on_generate_cutout,
         inputs=[c["canvas_img"], c["engine_mode"], c["tab2_output_mode"],
                 c["points_state"], c["labels_state"], c["box_state"],
@@ -358,6 +360,7 @@ def bind_tab2_events(demo, c, model_concurrency_limit):
         outputs=[c["result_img"], c["canvas_preview_actions"],
                  c["canvas_result_editor"], c["canvas_editor_actions"],
                  c["canvas_result_title"], c["canvas_enter_refine_btn"],
+                 c["result_view_btn"], c["result_download_btn"],
                  c["cutout_status"]],
     )
     c["canvas_exit_refine_btn"].click(

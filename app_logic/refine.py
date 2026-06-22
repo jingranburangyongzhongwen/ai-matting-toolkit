@@ -48,6 +48,12 @@ def _make_editor_value(rgba):
     return {"background": rgba, "layers": [], "composite": rgba}
 
 
+def _empty_editor_value():
+    """Return a harmless hidden ImageEditor value for Gradio 6.15 remounts."""
+    empty = np.zeros((1, 1, 4), dtype=np.uint8)
+    return {"background": empty, "layers": [], "composite": empty}
+
+
 def _normal_result_title():
     return ('<div class="section-title">效果预览 '
             '<span class="badge">透明背景</span></div>')
@@ -58,7 +64,7 @@ def _normal_canvas_result_title():
             '<span class="badge">抠图结果</span></div>')
 
 
-def _clear_manual_refine_updates(normal_title=None):
+def _clear_manual_refine_updates(normal_title=None, preview_visible=True):
     """Return UI/state updates that prevent stale manual-refine state after image changes."""
     if normal_title is None:
         normal_title = _normal_result_title()
@@ -68,15 +74,15 @@ def _clear_manual_refine_updates(normal_title=None):
         None,                      # current_rgba_state
         [],                        # edit_history_state
         gr.update(visible=False),  # enter_refine_btn
-        gr.update(value=None, visible=False),  # auto_result_editor
+        gr.update(value=_empty_editor_value(), visible="hidden"),  # auto_result_editor
         gr.update(visible=False),  # editor_actions
-        gr.update(visible=True),   # preview_actions
+        gr.update(visible=preview_visible),  # preview_actions
         gr.update(value=normal_title),
     )
 
 
-def _clear_canvas_manual_refine_updates():
-    return _clear_manual_refine_updates(_normal_canvas_result_title())
+def _clear_canvas_manual_refine_updates(preview_visible=True):
+    return _clear_manual_refine_updates(_normal_canvas_result_title(), preview_visible)
 
 
 # ── 回调函数 ─────────────────────────────────────────────────────
@@ -84,18 +90,20 @@ def _clear_canvas_manual_refine_updates():
 def on_enter_refine_mode(current_rgba_state):
     """Switch from preview to editor mode."""
     if current_rgba_state is None:
-        return [gr.update()] * 6 + ["请先完成抠图"]
+        return [gr.update()] * 8 + ["请先完成抠图"]
     editor_val = _make_editor_value(current_rgba_state)
     title = ('<div class="section-title">边缘修复 '
              '<span class="badge">画笔涂抹</span> '
              '<span class="section-hint">涂抹污染区域，涂完点应用</span></div>')
     return (
-        gr.update(visible=False),       # auto_result_img
+        gr.update(value=None, visible=False),  # auto_result_img
         gr.update(visible=False),       # preview_actions
         gr.update(value=editor_val, visible=True),  # auto_result_editor
         gr.update(visible=True),        # editor_actions
         gr.update(value=title),         # result_title
         gr.update(visible=False),       # enter_refine_btn
+        gr.update(visible=False),       # auto_result_view_btn
+        gr.update(visible=False),       # auto_result_download_btn
         "修复模式：涂抹绿/蓝边，涂完点「应用修复」",
     )
 
@@ -106,7 +114,7 @@ def on_exit_refine_mode(current_rgba_state):
     return (
         gr.update(value=current_rgba_state, visible=True),
         gr.update(visible=True),
-        gr.update(visible=False),
+        gr.update(value=_empty_editor_value(), visible="hidden"),
         gr.update(visible=False),
         gr.update(value=_normal_result_title()),
         gr.update(visible=has_result),
@@ -119,18 +127,20 @@ def on_exit_refine_mode(current_rgba_state):
 def on_enter_canvas_refine_mode(current_rgba_state):
     """Switch Tab 2 result preview into the shared edge-refine editor."""
     if current_rgba_state is None:
-        return [gr.update()] * 6 + ["请先生成抠图结果"]
+        return [gr.update()] * 8 + ["请先生成抠图结果"]
     editor_val = _make_editor_value(current_rgba_state)
     title = ('<div class="section-title">边缘修复 '
              '<span class="badge">涂抹蒙版</span> '
              '<span class="section-hint">涂抹污染边缘，然后点击应用修复</span></div>')
     return (
-        gr.update(visible=False),
-        gr.update(visible=False),
-        gr.update(value=editor_val, visible=True),
-        gr.update(visible=True),
-        gr.update(value=title),
-        gr.update(visible=False),
+        gr.update(value=None, visible=False),  # result_img
+        gr.update(visible=False),              # canvas_preview_actions
+        gr.update(value=editor_val, visible=True),  # canvas_result_editor
+        gr.update(visible=True),               # canvas_editor_actions
+        gr.update(value=title),                # canvas_result_title
+        gr.update(visible=False),              # canvas_enter_refine_btn
+        gr.update(visible=False),              # result_view_btn
+        gr.update(visible=False),              # result_download_btn
         "修复模式：涂抹污染边缘区域，然后点击应用修复",
     )
 
@@ -141,7 +151,7 @@ def on_exit_canvas_refine_mode(current_rgba_state):
     return (
         gr.update(value=current_rgba_state, visible=True),
         gr.update(visible=True),
-        gr.update(visible=False),
+        gr.update(value=_empty_editor_value(), visible="hidden"),
         gr.update(visible=False),
         gr.update(value=_normal_canvas_result_title()),
         gr.update(visible=has_result),

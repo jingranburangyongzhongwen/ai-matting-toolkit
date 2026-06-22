@@ -19,4 +19,4 @@ Pillow
 numpy
 
 # Web UI
-gradio>=4.0
+gradio>=6.0
